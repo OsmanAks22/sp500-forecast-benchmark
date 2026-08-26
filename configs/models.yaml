@@ -1,0 +1,48 @@
+# Thirteen models across four generations. Seven come from the approved
+# proposal; six are additions that close the gap to the 2026 literature.
+version: 1
+
+tier_0_baselines:
+  - {name: Naive,               lib: statsforecast, cost: negligible}
+  - {name: RandomWalkWithDrift, lib: statsforecast, cost: negligible}
+
+tier_1_statistical:            # proposal
+  - {name: AutoARIMA, lib: statsforecast, refit: per_fold, cost: cpu_hours}
+  - {name: AutoETS,   lib: statsforecast, refit: per_fold, cost: cpu_minutes}
+
+tier_2_linear:                 # ADDED - Zeng et al. (2023) is cited in the
+  - {name: DLinear, lib: neuralforecast, cost: gpu_minutes}   # proposal; its
+  - {name: NLinear, lib: neuralforecast, cost: gpu_minutes}   # model must be in
+
+tier_2_recurrent:              # proposal
+  - {name: LSTM, lib: neuralforecast, global: true, cost: gpu_hours}
+  - {name: GRU,  lib: neuralforecast, global: true, cost: gpu_hours}
+
+tier_2_transformer:            # proposal
+  - {name: PatchTST, lib: neuralforecast, global: true, cost: gpu_hours}
+  - {name: TFT,      lib: neuralforecast, global: true, cost: gpu_hours}
+  - {name: TimesNet, lib: neuralforecast, global: true, cost: gpu_hours}
+
+tier_3_foundation:             # ADDED - zero-shot, inference only
+  - name: Chronos-Bolt-small
+    checkpoint: amazon/chronos-bolt-small
+    mode: zero_shot
+    note: "Direct quantile output in one forward pass; feeds CRPS directly."
+  - name: Kronos-small
+    checkpoint: NeoQuasar/Kronos-small
+    tokenizer: NeoQuasar/Kronos-Tokenizer-base
+    mode: zero_shot
+    native_input: ohlcv
+    note: "Domain-specific TSFM, AAAI 2026. Separate API - budget integration time."
+
+training:
+  loss: MQLoss
+  quantiles: [0.1, 0.25, 0.5, 0.75, 0.9]
+  hyperparameters: published_defaults
+  tuning:
+    enabled: true
+    scope: PatchTST_only
+    trials: 15
+    rationale: "Compute-budget constraint, stated explicitly in Limitations."
+  seed: 20260826
+  deterministic: true

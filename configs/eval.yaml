@@ -1,0 +1,36 @@
+version: 1
+
+cross_validation:
+  scheme: purged_expanding_walk_forward
+  horizon: 1
+  embargo: 5                  # trading sessions
+  test_windows:
+    - ["2020-01-01", "2020-12-31"]   # COVID crash and rebound
+    - ["2021-01-01", "2021-12-31"]   # low-volatility bull
+    - ["2022-01-01", "2022-12-31"]   # rate-driven bear
+    - ["2023-01-01", "2026-08-25"]   # recovery and expansion
+
+quantiles: [0.1, 0.25, 0.5, 0.75, 0.9]
+point_forecast_from: median
+
+metrics:
+  point:        [rmse, mae, mase, directional_accuracy]
+  probabilistic:[crps, picp_80, mean_interval_score_80]
+
+significance:
+  test: diebold_mariano
+  harvey_correction: true
+  multiple_testing: benjamini_hochberg
+  alpha: 0.05
+
+stratification:
+  volatility: [low_vol, mid_vol, high_vol]
+  direction:  [bull, correction, bear]
+  per_ticker: true
+  per_sector: true
+
+backtest:
+  mode: long_flat
+  cost_bps: [0, 2, 5, 10]
+  report: [turnover_ann, break_even_cost_bps, sharpe_net, deflated_sharpe_prob, max_drawdown]
+  benchmark: buy_and_hold
