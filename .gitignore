@@ -5,14 +5,18 @@ __pycache__/
 venv/
 .env
 
-# Data and outputs are regenerable; keep them out of git
-data/
-forecasts/
-results/
+# Data and outputs are regenerable; keep them out of git.
+# Anchored to the repository root with a leading slash: an unanchored `data/`
+# also matches src/sp500bench/data/, which silently kept the package's data
+# module - the frozen universe and the FRED release lags - out of version
+# control entirely.
+/data/
+/forecasts/
+/results/
+/mlruns/
+/wandb/
 *.parquet
 *.csv
-mlruns/
-wandb/
 
 .DS_Store
 .ipynb_checkpoints/
