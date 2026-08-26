@@ -1,4 +1,4 @@
-.PHONY: help setup data features baselines neural foundation evaluate backtest report test all clean
+.PHONY: help setup data features baselines neural foundation evaluate backtest report test all clean clean-all
 
 help:
 	@echo "make setup       install dependencies"
@@ -11,6 +11,8 @@ help:
 	@echo "make backtest    cost-aware strategy simulation + deflated Sharpe"
 	@echo "make test        leakage and numerical test suites"
 	@echo "make all         full pipeline, end to end"
+	@echo "make clean       remove derived data; keeps the raw download cache"
+	@echo "make clean-all   also remove data/raw - forces a full re-download"
 
 setup:
 	pip install -e ".[full]"
@@ -41,5 +43,15 @@ test:
 
 all: data features baselines neural foundation evaluate backtest
 
+# Everything derived. data/raw is deliberately spared so a rebuild does not
+# re-hit yfinance and FRED; use clean-all for that.
 clean:
 	rm -rf data/interim data/processed forecasts/ .pytest_cache
+	rm -f data/features.parquet data/regimes.parquet data/scalers.parquet
+	rm -f data/quality_report.json
+
+# Additionally drops the raw download cache. The next `make data` therefore
+# re-downloads all 50 tickers, the index proxy and every FRED series from
+# scratch - minutes, not seconds, and subject to yfinance rate limiting.
+clean-all: clean
+	rm -rf data/raw
