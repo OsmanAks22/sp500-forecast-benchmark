@@ -62,10 +62,52 @@ represent the fat tails and volatility clustering of daily equity returns.
 **H3 (primary).** Model rankings are not stable across volatility and drawdown
 regimes; aggregate metrics conceal regime-specific failure.
 
+*Scope note, recorded 26 August 2026, before any model was run.* The test
+period supports volatility stratification comfortably — 194 low-vol, 761
+mid-vol and 715 high-vol sessions — but the drawdown axis is thin at the tail:
+`bear` is 73 sessions, 4.4% of the test period. Confidence intervals in that
+cell will be wide, and a model that looks best there may simply be the one that
+happened to fit 73 days. Any `bear` result is reported with its interval and
+treated as indicative, never as a ranking.
+
+The decision **not** to merge `correction` and `bear` into one drawdown bucket
+was taken on the same date, before any results existed. Merging would buy
+statistical power at the cost of the distinction the hypothesis is about: a
+10% pullback and a 20% bear market are different regimes for a forecasting
+model, and collapsing them to widen a cell would answer an easier question than
+the one registered. The thresholds in `features/regimes.py` are unchanged.
+
 **H4 (primary).** The apparent advantage of pre-trained foundation models
 narrows on the clean slice that post-dates their pre-training cutoff.
 *Only Kronos has a documented cutoff (June 2024); for the others this is a
 limitation, not a controlled comparison.*
+
+*Scope narrowed 26 August 2026, before any model was run.* **H4 is tested on
+aggregate performance only.** The clean slice is 247 sessions: 100% bull, 78%
+mid-vol, and just 4 low-vol days. It cannot support regime stratification —
+several cells are empty and the rest are too small to carry an interval — so
+the contamination comparison is made on aggregate metrics across the slice.
+
+The consequence is worth stating plainly: **H3 and H4 cannot be answered on the
+same data.** H3 needs regime variation, which lives in the full test period;
+H4 needs the post-cutoff window, which has almost none. Results for the two are
+reported separately and are not combined into a claim about regime-specific
+contamination effects, which this design cannot support.
+
+Sessions by regime, from `data/regimes.parquet`:
+
+| split | window | sessions | low | mid | high | bull | corr | bear |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| train | 2005-01-01 – 2016-12-31 | 3,021 | 1,007 | 1,006 | 1,007 | 2,199 | 314 | 257 |
+| val | 2017-01-01 – 2019-12-31 | 754 | 442 | 231 | 81 | 725 | 29 | 0 |
+| test | 2020-01-01 – 2026-08-25 | 1,670 | 194 | 761 | 715 | 1,337 | 260 | 73 |
+| clean slice | 2025-09-01 – 2026-08-25 | 247 | 4 | 193 | 50 | 247 | 0 | 0 |
+
+The clean slice is a subset of test, not a fifth disjoint period, so the rows do
+not sum to the full sample. Train splits 1,007/1,006/1,007 by construction — the
+terciles are fitted there — which is the check that they were never refitted
+later. Train carries 251 sessions with no drawdown label, the warm-up for the
+trailing 252-session peak.
 
 **H5 (secondary, pre-registered).** On 21-day realised volatility, models
 separate clearly and at least one beats Log-HAR - but the margin is small.
@@ -229,6 +271,21 @@ index membership, so firms that failed or were delisted are absent. Correcting
 this needs point-in-time constituent data (CRSP/Compustat), which is licensed
 and outside the project's zero-cost constraint. Stated in Limitations; expect it
 in the viva.
+
+**Known limitation — validation contains no drawdown regime.** The validation
+period, 2017-2019, holds zero `bear` sessions and 29 `correction` sessions:
+96.2% of it is `bull`. Every hyperparameter choice, and the single tuning budget
+spent on PatchTST, is therefore made on a stretch of market history containing
+no crisis. Model selection in this study is structurally blind to the drawdown
+regime that H3 concerns.
+
+This is not a fixable flaw so much as an honest one. It mirrors real practice —
+hyperparameters cannot be chosen on a crisis that has not happened yet, and a
+practitioner in December 2019 faced exactly this validation set. But it must not
+be presented as regime-robust selection. Where a model performs well in the test
+period's `correction` or `bear` cells, that is out-of-sample in a stronger sense
+than the aggregate figures suggest; where it performs badly, selection never had
+the chance to catch it.
 
 **Known limitation — credit spread substitution.** The proposal specified
 BAMLH0A0HYM2, the ICE BofA high-yield option-adjusted spread. FRED serves the
