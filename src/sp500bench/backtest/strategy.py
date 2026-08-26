@@ -44,18 +44,35 @@ def run_backtest(
     cost_bps: float = 5.0,
     n_trials: int = 1,
     periods_per_year: int = 252,
-) -> dict[str, float]:
+) -> dict[str, float | str]:
     """Simulate the strategy and return its performance summary.
 
     Positions are applied to the *next* period's return - the signal formed at
     the close of ``t`` earns ``r[t+1]``. Getting this off by one turns a null
     result into a spectacular one, so it is done here, once, explicitly.
+
+    Cost convention - round trip
+    ----------------------------
+    ``cost_bps`` is a **round-trip** cost. That is the unit used in
+    ``configs/eval.yaml``, in the README, and in the H1 falsification criterion
+    ("break-even above 5 bps round trip"), so it is the unit the public
+    interface speaks.
+
+    A round trip is two legs, one in and one out, and ``traded`` counts legs -
+    it is ``|delta position|``, which registers 1 on entry and 1 again on exit.
+    Each leg is therefore charged ``cost_bps / 2``. Charging the full figure per
+    leg would bill every round trip twice and halve the reported break-even,
+    which is the number H1 turns on.
+
+    ``break_even_round_trip_bps`` is returned in the same unit, and
+    ``cost_convention`` states it in the output so no downstream table has to
+    infer it.
     """
     pos = positions.reindex(realised_returns.index).fillna(0.0)
     gross = pos.shift(1).fillna(0.0) * realised_returns
 
     traded = pos.diff().abs().fillna(pos.abs())
-    cost = traded * (cost_bps / 10_000.0)
+    cost = traded * (cost_bps / 2.0 / 10_000.0)
     net = gross - cost
 
     equity = (1.0 + net).cumprod()
@@ -66,8 +83,12 @@ def run_backtest(
 
     gross_mean = float(gross.mean())
     trade_rate = float(traded.mean())
-    break_even_bps = (
-        float(gross_mean / trade_rate * 10_000.0) if trade_rate > 0 else float("inf")
+    # Round trip = two legs, so the break-even round-trip cost is twice the
+    # per-leg figure the gross edge can absorb.
+    break_even_round_trip_bps = (
+        float(2.0 * gross_mean / trade_rate * 10_000.0)
+        if trade_rate > 0
+        else float("inf")
     )
 
     dsr = deflated_sharpe_ratio(net.to_numpy(), n_trials=n_trials,
@@ -82,7 +103,8 @@ def run_backtest(
         "deflated_sharpe_prob": dsr["dsr"],
         "max_drawdown": float(drawdown.min()),
         "turnover_ann": turnover,
-        "break_even_cost_bps": break_even_bps,
+        "break_even_round_trip_bps": break_even_round_trip_bps,
         "cost_bps_assumed": float(cost_bps),
+        "cost_convention": "round_trip",
         "hit_rate": float((gross[gross != 0] > 0).mean()) if (gross != 0).any() else float("nan"),
     }

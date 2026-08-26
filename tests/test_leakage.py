@@ -122,17 +122,77 @@ def test_train_and_test_indices_never_intersect() -> None:
         embargo=5,
         train_start="2015-01-01",
     )
+    calendar = pd.DatetimeIndex(panel["ds"].unique())
     for split, train, test in cv.iter_frames(panel):
         assert set(train["ds"]).isdisjoint(set(test["ds"]))
-        assert_no_overlap(train["ds"], test["ds"], horizon=1, embargo=5)
+        assert_no_overlap(train["ds"], test["ds"], horizon=1, embargo=5,
+                          calendar=calendar)
 
 
 def test_overlap_assertion_actually_fires() -> None:
     """A guard that never fails is not a guard."""
     train = pd.Series(pd.bdate_range("2019-01-01", "2019-12-31"))
     test = pd.Series(pd.bdate_range("2020-01-01", "2020-06-30"))
+    calendar = pd.DatetimeIndex(pd.concat([train, test]).unique())
     with pytest.raises(AssertionError):
-        assert_no_overlap(train, test, horizon=1, embargo=90)
+        assert_no_overlap(train, test, horizon=1, embargo=90, calendar=calendar)
+
+
+def _holiday_calendar() -> pd.DatetimeIndex:
+    """Business days over the 2019/20 turn, minus two market holidays."""
+    holidays = {pd.Timestamp("2019-12-25"), pd.Timestamp("2020-01-01")}
+    return pd.DatetimeIndex(
+        [d for d in pd.bdate_range("2019-11-01", "2020-03-31") if d not in holidays]
+    )
+
+
+def test_embargo_is_counted_in_sessions_not_calendar_days() -> None:
+    """The holiday case that a day-counting embargo silently waves through.
+
+    Christmas 2019 fell on a Wednesday, so Friday 20 December to Friday 27
+    December spans seven calendar days but only four sessions. Against an
+    embargo of five sessions the gap is two sessions short, and a check written
+    in ``Timedelta.days`` would have passed it.
+    """
+    calendar = _holiday_calendar()
+    train = pd.Series(calendar[calendar <= "2019-12-20"])
+    test = pd.Series(calendar[calendar >= "2019-12-27"])
+
+    gap_days = (test.min() - train.max()).days
+    gap_sessions = int(calendar.searchsorted(test.min())) - int(
+        calendar.searchsorted(train.max())
+    )
+    assert gap_days == 7 and gap_sessions == 4, "fixture no longer spans the holiday"
+    assert gap_days > 5 > gap_sessions, "the day count must look acceptable here"
+
+    with pytest.raises(AssertionError, match="embargo violated"):
+        assert_no_overlap(train, test, horizon=1, embargo=5, calendar=calendar)
+
+
+def test_embargo_passes_at_exactly_the_required_session_count() -> None:
+    """The boundary is exact: one more session and the same gap is admissible."""
+    calendar = _holiday_calendar()
+    train = pd.Series(calendar[calendar <= "2019-12-20"])
+    test = pd.Series(calendar[calendar >= "2019-12-30"])
+
+    gap_sessions = int(calendar.searchsorted(test.min())) - int(
+        calendar.searchsorted(train.max())
+    )
+    assert gap_sessions == 5
+    assert_no_overlap(train, test, horizon=1, embargo=5, calendar=calendar)
+
+
+def test_purge_is_counted_in_sessions_too() -> None:
+    """A multi-session horizon must be walked on the calendar, not the clock."""
+    calendar = _holiday_calendar()
+    train = pd.Series(calendar[calendar <= "2019-12-20"])
+    test = pd.Series(calendar[calendar >= "2019-12-27"])
+
+    # Four sessions of gap: a horizon of 4 puts the last training label exactly
+    # on the first test session.
+    with pytest.raises(AssertionError, match="leakage"):
+        assert_no_overlap(train, test, horizon=4, embargo=0, calendar=calendar)
+    assert_no_overlap(train, test, horizon=3, embargo=0, calendar=calendar)
 
 
 def test_overlapping_test_windows_are_rejected() -> None:

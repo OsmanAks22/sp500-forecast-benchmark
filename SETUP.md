@@ -14,7 +14,7 @@ Later, on Kaggle, add: `statsforecast neuralforecast yfinance fredapi pyarrow`
 PYTHONPATH=src pytest tests/ -q
 ```
 
-Expected: `59 passed`
+Expected: `80 passed`
 
 ## 3. Freeze the pre-registration
 
@@ -41,7 +41,9 @@ Removes the need for the `PYTHONPATH=src` prefix.
 ```
 configs/          frozen experiment specification
 src/sp500bench/   the package — do not flatten this tree, imports depend on it
-tests/            59 tests: leakage (25), numerical (13), MCS/HAR/robust-SE (21)
-scripts/          pipeline entry points (to be written)
+tests/            80 tests: leakage (28), numerical (13),
+                  MCS/HAR/robust-SE (21), backtest costs (18)
+scripts/          pipeline entry points — not yet written; `make all` cannot run
+                  until they exist
 notebooks/        exploration only
 ```
