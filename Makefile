@@ -6,7 +6,7 @@ help:
 	@echo "make features    build causal features and regime labels"
 	@echo "make baselines   Naive, RWD, AutoARIMA, AutoETS  (CPU, overnight)"
 	@echo "make neural      DLinear, NLinear, LSTM, GRU, PatchTST, TFT, TimesNet"
-	@echo "make foundation  Chronos-Bolt, Kronos  (inference only)"
+	@echo "make foundation  Chronos-2, TimesFM-2.5, Moirai-2.0, Kronos-small (inference only)"
 	@echo "make evaluate    metrics, DM tests, BH-FDR, regime stratification"
 	@echo "make backtest    cost-aware strategy simulation + deflated Sharpe"
 	@echo "make test        leakage and numerical test suites"

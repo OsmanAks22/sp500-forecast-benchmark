@@ -1,8 +1,14 @@
-# Thirteen models across four generations. Seven come from the approved
-# proposal; six are additions that close the gap to the 2026 literature.
-version: 1
+# Seventeen models across four generations, plus the volatility arm.
+# Nine come from the approved proposal; eight are additions that close the gap
+# to the 2026 literature.
+#
+# This file must agree with src/sp500bench/models/registry.py, which is the
+# executable source of truth. Version 2 resyncs Tier 3 to the second-generation
+# foundation checkpoints and adds the HAR volatility arm, both of which the
+# registry already carried.
+version: 2
 
-tier_0_baselines:
+tier_0_baselines:              # proposal
   - {name: Naive,               lib: statsforecast, cost: negligible}
   - {name: RandomWalkWithDrift, lib: statsforecast, cost: negligible}
 
@@ -23,17 +29,58 @@ tier_2_transformer:            # proposal
   - {name: TFT,      lib: neuralforecast, global: true, cost: gpu_hours}
   - {name: TimesNet, lib: neuralforecast, global: true, cost: gpu_hours}
 
-tier_3_foundation:             # ADDED - zero-shot, inference only
-  - name: Chronos-Bolt-small
-    checkpoint: amazon/chronos-bolt-small
+# ADDED - zero-shot, inference only. Second-generation checkpoints: the
+# 2024-era models they replace (Chronos-Bolt and its contemporaries) are one
+# generation behind as of August 2026.
+#
+# Only Kronos documents a pre-training cutoff. For the other three the cutoff is
+# undocumented, which is itself reportable: without it no zero-shot comparison
+# on recent data can be certified contamination-free. See the clean slice in
+# configs/data.yaml.
+tier_3_foundation:
+  - name: Chronos-2
+    lib: chronos
+    checkpoint: amazon/chronos-2
     mode: zero_shot
-    note: "Direct quantile output in one forward pass; feeds CRPS directly."
+    pretrain_cutoff: undocumented
+    note: "Current SOTA generic TSFM; native quantile + covariate support."
+  - name: TimesFM-2.5
+    lib: timesfm
+    checkpoint: google/timesfm-2.5-200m-pytorch
+    mode: zero_shot
+    pretrain_cutoff: undocumented
+    note: "Decoder-only, patch-based, continuous quantile head."
+  - name: Moirai-2.0
+    lib: uni2ts
+    checkpoint: Salesforce/moirai-2.0-R-small
+    mode: zero_shot
+    pretrain_cutoff: undocumented
+    note: "Decoder-only with multi-token prediction; top GIFT-Eval ranking."
   - name: Kronos-small
+    lib: kronos
     checkpoint: NeoQuasar/Kronos-small
     tokenizer: NeoQuasar/Kronos-Tokenizer-base
     mode: zero_shot
     native_input: ohlcv
-    note: "Domain-specific TSFM, AAAI 2026. Separate API - budget integration time."
+    pretrain_cutoff: "2024-06"
+    context_limit: 512
+    note: "Domain-specific TSFM, AAAI 2026. Separate API - budget integration
+           time. Autoregressive sampling, so CRPS comes from sampled paths, not
+           a closed-form quantile head."
+
+# Volatility arm only. HAR is the field-standard comparator; a volatility claim
+# made without it is indefensible. Implemented in-package rather than pulled
+# from a library - three regressors are easier to defend than a wrapper.
+volatility_arm:
+  - name: HAR-RV
+    lib: sp500bench
+    target: volatility
+    note: "Corsi (2009) heterogeneous autoregressive cascade."
+  - name: Log-HAR
+    lib: sp500bench
+    target: volatility
+    note: "The benchmark most TSFMs fail to beat (Brini, 2026). Smearing
+           correction applied on back-transform."
 
 training:
   loss: MQLoss

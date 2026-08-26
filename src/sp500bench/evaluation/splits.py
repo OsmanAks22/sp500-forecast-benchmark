@@ -147,9 +147,12 @@ class PurgedWalkForward:
         """Yield ``(split, train_df, test_df)`` for each fold.
 
         The training frame is truncated at ``split.train_end`` *inclusive*, which
-        already accounts for purge and embargo.
+        already accounts for purge and embargo. Every fold is re-checked by
+        :func:`assert_no_overlap` against the panel's own calendar before it is
+        handed out, so a panel whose sessions differ from the ones the folds were
+        sized against fails loudly instead of leaking quietly.
         """
-        calendar = pd.DatetimeIndex(panel[time_col].unique())
+        calendar = pd.DatetimeIndex(panel[time_col].unique()).sort_values().unique()
         for split in self.splits(calendar):
             train_mask = (panel[time_col] >= self.train_start) & (
                 panel[time_col] <= split.train_end
@@ -157,7 +160,16 @@ class PurgedWalkForward:
             test_mask = (panel[time_col] >= split.test_start) & (
                 panel[time_col] <= split.test_end
             )
-            yield split, panel.loc[train_mask].copy(), panel.loc[test_mask].copy()
+            train_df = panel.loc[train_mask].copy()
+            test_df = panel.loc[test_mask].copy()
+            assert_no_overlap(
+                train_df[time_col],
+                test_df[time_col],
+                horizon=self.horizon,
+                embargo=self.embargo,
+                calendar=calendar,
+            )
+            yield split, train_df, test_df
 
 
 def assert_no_overlap(
@@ -165,24 +177,57 @@ def assert_no_overlap(
     test_time: pd.Series,
     horizon: int,
     embargo: int,
+    calendar: pd.DatetimeIndex,
 ) -> None:
     """Raise if any training label window reaches into the test window.
 
-    Called from the test suite and, defensively, from the experiment runner.
+    Both the purge and the embargo are measured in *sessions*, by position in
+    ``calendar`` - never in calendar days. The distinction is not pedantic. An
+    embargo of five sessions spanning Christmas is seven or more calendar days,
+    so a day-counting check waves through a gap that is two sessions short of
+    the design. A guard measured in the wrong unit is worse than no guard,
+    because it reads as reassurance.
+
+    Parameters
+    ----------
+    train_time, test_time:
+        Timestamp columns of the two folds.
+    horizon:
+        Forecast horizon in sessions. A label stamped at ``t`` consumes data
+        through ``horizon`` sessions beyond ``t``.
+    embargo:
+        Sessions required between the last training timestamp and the first test
+        timestamp.
+    calendar:
+        The trading calendar both folds are drawn from. A timestamp that is not
+        itself a session resolves to the next session, which tightens the check
+        rather than loosening it.
+
+    Called from the test suite and from :meth:`PurgedWalkForward.iter_frames`.
     Cheap enough to leave switched on in production runs.
     """
     if train_time.empty or test_time.empty:
         return
-    last_train_label_end = train_time.max() + pd.Timedelta(days=horizon)
-    first_test = test_time.min()
-    if last_train_label_end >= first_test:
+    calendar = pd.DatetimeIndex(calendar).sort_values().unique()
+    if len(calendar) == 0:
+        raise ValueError("calendar is empty; a gap cannot be measured in sessions")
+
+    last_train = pd.Timestamp(train_time.max())
+    first_test = pd.Timestamp(test_time.min())
+    train_pos = int(calendar.searchsorted(last_train, side="left"))
+    test_pos = int(calendar.searchsorted(first_test, side="left"))
+
+    if train_pos + horizon >= test_pos:
         raise AssertionError(
-            f"leakage: last training label extends to {last_train_label_end.date()} "
-            f"but test begins {first_test.date()}"
+            f"leakage: the last training label at {last_train.date()} consumes "
+            f"data {horizon} session(s) forward, reaching the test window that "
+            f"opens {first_test.date()}"
         )
-    sessions_between = (first_test - train_time.max()).days
+
+    sessions_between = test_pos - train_pos
     if sessions_between < embargo:
         raise AssertionError(
-            f"embargo violated: only {sessions_between} days between folds, "
-            f"{embargo} required"
+            f"embargo violated: {sessions_between} session(s) between "
+            f"{last_train.date()} and {first_test.date()}, {embargo} required "
+            f"({(first_test - last_train).days} calendar days - do not count these)"
         )

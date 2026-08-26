@@ -31,6 +31,10 @@ stratification:
 
 backtest:
   mode: long_flat
+  # Round-trip basis points. The simulator splits each figure across the two
+  # legs of a round trip; break-even is reported in the same round-trip unit,
+  # which is the unit the H1 falsification criterion is written in.
+  cost_convention: round_trip
   cost_bps: [0, 2, 5, 10]
-  report: [turnover_ann, break_even_cost_bps, sharpe_net, deflated_sharpe_prob, max_drawdown]
+  report: [turnover_ann, break_even_round_trip_bps, sharpe_net, deflated_sharpe_prob, max_drawdown]
   benchmark: buy_and_hold

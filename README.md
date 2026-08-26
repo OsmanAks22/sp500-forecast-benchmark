@@ -114,7 +114,7 @@ insufficient.
 | Scaling | per ticker, train statistics only | |
 | Loss | `MQLoss`, q ∈ {0.1, 0.25, 0.5, 0.75, 0.9} | Median is the point forecast — one training run serves both. |
 
-## The thirteen models
+## The seventeen models
 
 | Tier | Models | Scope | Source |
 |---|---|---|---|
@@ -161,7 +161,7 @@ certainly seen these tickers over 2020–2025.
 
 The protocol:
 
-1. Report full-test-period results for all thirteen models, with foundation
+1. Report full-test-period results for all seventeen models, with foundation
    models flagged as potentially contaminated.
 2. Repeat the entire comparison on the clean slice.
 3. Report the gap between the two as a finding in its own right.
@@ -199,9 +199,9 @@ three times larger. Both figures are reported side by side, along with the
 minimum detectable effect.
 
 **Economic** — long/flat strategy at 0, 2, 5 and 10 bps round-trip. Reports
-annualised turnover, **break-even cost in basis points**, and the **Deflated
-Sharpe Ratio** (Bailey & López de Prado, 2014), which discounts the observed
-Sharpe by the number of variants tried.
+annualised turnover, **break-even cost in round-trip basis points**, and the
+**Deflated Sharpe Ratio** (Bailey & López de Prado, 2014), which discounts the
+observed Sharpe by the number of variants tried.
 
 *"Profitable below 4 bps round-trip"* is a professional claim.
 *"Returns 18% annually"* without costs is not.
@@ -210,10 +210,12 @@ Sharpe by the number of variants tried.
 
 ## Leakage controls
 
-Enforced in code and verified by `tests/test_leakage.py` — 25 adversarial tests
+Enforced in code and verified by `tests/test_leakage.py` — 28 adversarial tests
 that corrupt future data and assert nothing upstream moves.
 
-- Purged, embargoed, expanding-window CV on the session calendar
+- Purged, embargoed, expanding-window CV on the session calendar — both the
+  purge and the embargo are counted in *sessions*, by position in the calendar,
+  never in calendar days, so a holiday cannot silently shorten the gap
 - Trailing rolling windows only; no centred windows, no backward interpolation
 - Macro series shifted by explicit publication lags (CPI = 45 days) *before*
   any forward fill
@@ -240,16 +242,32 @@ src/sp500bench/
   evaluation/     purged CV, metrics, DM + BH-FDR + DSR
   models/         uniform registry over all four tiers
   backtest/       cost-aware simulation
-tests/            leakage (25) + numerical (13) + MCS/HAR/robust-SE (21)
-scripts/          pipeline entry points
+tests/            leakage (28) + numerical (13) + MCS/HAR/robust-SE (21)
+                  + backtest cost accounting (18)
+scripts/          pipeline entry points — not yet written
 ```
 
 ## Reproducing
 
+The library and its test suite are complete and run today:
+
 ```bash
-make setup
+make setup        # installs the package and the [full] extra
+make test         # 80 tests, ~5 s
+```
+
+**The pipeline scripts are not yet written.** `scripts/` is empty, so
+`make data`, `make features`, `make baselines`, `make neural`,
+`make foundation`, `make evaluate`, `make backtest` and `make all` will fail
+until the five entry points they invoke exist. What is frozen and working so
+far is the specification in `configs/`, the evaluation and leakage machinery in
+`src/sp500bench/`, and the tests that hold them to it. The pre-registration in
+this file is timestamped independently of any of that, by commit date.
+
+Once the scripts land:
+
+```bash
 make all          # data → features → models → evaluation → backtest
-make test         # 59 tests, ~4 s
 ```
 
 Seeds fixed at 20260826; `torch.use_deterministic_algorithms(True)`.

@@ -3,6 +3,25 @@ name = "sp500bench"
 version = "0.1.0"
 description = "Three generations of forecasting models on S&P 500 daily returns"
 requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "pyyaml",
+]
+
+# `make setup` installs this extra. The core install above carries only what the
+# library itself imports; everything below is needed to actually run the
+# pipeline - data download, model fitting, parquet IO, tests.
+[project.optional-dependencies]
+full = [
+    "statsforecast",
+    "neuralforecast",
+    "yfinance",
+    "fredapi",
+    "pyarrow",
+    "pytest",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
