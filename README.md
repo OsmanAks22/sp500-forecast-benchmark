@@ -230,6 +230,31 @@ this needs point-in-time constituent data (CRSP/Compustat), which is licensed
 and outside the project's zero-cost constraint. Stated in Limitations; expect it
 in the viva.
 
+**Known limitation — credit spread substitution.** The proposal specified
+BAMLH0A0HYM2, the ICE BofA high-yield option-adjusted spread. FRED serves the
+licensed ICE BofA family on a rolling window of roughly three years, so on the
+build date the series began 2023-08-28 and its coverage across the frozen splits
+was: train 0%, validation 0%, test 45%, clean slice 100%.
+
+That gradient is not a gap, it is a confound. A column empty for every training
+row that switches on partway through the test period and is complete precisely
+on the clean slice would let vendor history masquerade as model skill in the one
+comparison H4 exists to make. It was substituted with **BAA10Y** — Moody's Baa
+corporate bond yield minus the 10-year Treasury — which is daily back to 1986 and
+covers 100% of every split.
+
+BAMLH0A0HYM2 is the better instrument on the merits: an option-adjusted
+high-yield spread is a cleaner read on credit risk than a Baa-minus-Treasury
+difference, which carries some duration exposure. The substitution trades
+instrument quality for sample coverage, and it is coverage that the design
+cannot do without. Recorded here because the swap is a deviation from the
+approved proposal.
+
+The defect was found on day one, before any model was run, by the per-split
+macro coverage audit in `scripts/build_dataset.py`; it is reported on every
+build and written to `data/quality_report.json`. `configs/data.yaml` is at
+version 2 for this change. No split date, hypothesis or metric moved.
+
 ---
 
 ## Repository layout
