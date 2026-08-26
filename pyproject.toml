@@ -8,6 +8,7 @@ dependencies = [
     "pandas",
     "scipy",
     "pyyaml",
+    "python-dotenv",
 ]
 
 # `make setup` installs this extra. The core install above carries only what the

@@ -31,7 +31,14 @@ MACRO_SERIES: list[MacroSeries] = [
     MacroSeries("DGS2",    "yield_2y",    1,  "2-year Treasury constant maturity"),
     MacroSeries("T10Y2Y",  "term_spread", 1,  "10y minus 2y term spread"),
     MacroSeries("DFF",     "fed_funds",   1,  "Effective federal funds rate"),
-    MacroSeries("BAMLH0A0HYM2", "hy_oas", 1,  "High-yield option-adjusted spread"),
+    # Credit spread. BAMLH0A0HYM2 (high-yield OAS) was the original choice and
+    # is the better instrument, but FRED serves the licensed ICE BofA family on
+    # a rolling window of roughly three years: it had zero coverage across the
+    # training and validation windows and full coverage only on the clean slice,
+    # a gradient aligned with the split boundaries. BAA10Y is daily back to 1986
+    # and spans the whole sample. See Limitations in README.md.
+    MacroSeries("BAA10Y", "credit_spread", 1,
+                "Moody's Baa corporate bond yield minus 10Y Treasury"),
     MacroSeries("CPIAUCSL","cpi",        45,  "CPI, all urban consumers (monthly)"),
     MacroSeries("UNRATE",  "unemployment",30, "Unemployment rate (monthly)"),
     MacroSeries("INDPRO",  "indpro",     45,  "Industrial production (monthly)"),

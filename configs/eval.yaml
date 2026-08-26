@@ -14,8 +14,8 @@ quantiles: [0.1, 0.25, 0.5, 0.75, 0.9]
 point_forecast_from: median
 
 metrics:
-  point:        [rmse, mae, mase, directional_accuracy]
-  probabilistic:[crps, picp_80, mean_interval_score_80]
+  point:         [rmse, mae, mase, directional_accuracy]
+  probabilistic: [crps, picp_80, mean_interval_score_80]
 
 significance:
   test: diebold_mariano
