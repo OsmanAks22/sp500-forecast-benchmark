@@ -1,152 +1,96 @@
 #!/usr/bin/env python
 """Fit and forecast one or more tiers of the roster.
 
-Step three of the pipeline. It reads the frozen specification in
-``configs/models.yaml`` and ``configs/eval.yaml``, resolves the tiers named on
-the command line against
-:data:`sp500bench.models.registry.REGISTRY` - the executable source of truth for
-the roster - and runs them over the purged walk-forward folds.
+Step three of the pipeline. It reads the frozen specification through
+:func:`sp500bench.config.load_configs` - which refuses to return if the training
+and evaluation quantile grids disagree - resolves the tiers named on the command
+line against :data:`sp500bench.models.registry.REGISTRY`, and runs them over the
+purged walk-forward folds from ``configs/eval.yaml``.
 
-The model execution layer is not written yet. What *is* written, and what runs
-today, is the configuration gate below: the checks that must pass before any
-model is allowed to consume compute. They are cheap, they run first, and they
-fail loudly.
+Only ``Naive`` has an executor so far. Every other model in a selected tier is
+reported and skipped, rather than silently omitted: a run that quietly produces
+fewer forecast files than the roster has models is how a missing model becomes a
+missing row in a results table nobody questions.
 
-Why the quantile grids are checked for equality
------------------------------------------------
-``MQLoss`` trains one output head per quantile level, so a neuralforecast model
-emits exactly the levels named in ``training.quantiles`` and no others. CRPS is
-approximated here by averaging pinball loss over the evaluation grid
-(:func:`sp500bench.evaluation.metrics.crps_from_quantiles`). If the two grids
-differ, one of two things happens, and both are silent:
-
-* the evaluation grid is *wider*, and the seven neuralforecast models cannot
-  supply the missing levels - so either the run crashes deep into the GPU
-  budget, or the metric quietly falls back to whatever levels are present;
-* the evaluation grid is *narrower*, and those models are scored on a subset of
-  what they optimised, while the twelve models that can emit arbitrary levels
-  are scored on the full grid.
-
-Either way CRPS stops being comparable across the roster, because an average of
-pinball losses over one grid is not commensurable with an average over another.
-H2 is a calibration hypothesis, so that would land directly on the headline
-result. The two grids diverged once already, between eval.yaml v2 and
-models.yaml v3; this check is here so it cannot happen a second time without
-someone being told.
+Outputs
+-------
+``forecasts/{model}/{fold}.parquet``  unique_id, ds, one column per quantile
+``results/timings.json``              per-model wall-clock, for the compute axis
 
 Usage
 -----
-    python scripts/run_experiment.py --tier baseline --tier statistical
-    python scripts/run_experiment.py --tier foundation --dry-run
+    python scripts/run_experiment.py --tier baseline
+    python scripts/run_experiment.py --tier baseline --tier statistical --dry-run
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import json
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
-import yaml
+import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
+from sp500bench.config import (ConfigError, load_configs,  # noqa: E402
+                               load_data_config)
+from sp500bench.evaluation.splits import PurgedWalkForward, assert_no_overlap  # noqa: E402
+from sp500bench.models.baselines import naive_forecast_fold  # noqa: E402
 from sp500bench.models.registry import REGISTRY, ModelSpec  # noqa: E402
 
 TIERS = ["baseline", "statistical", "linear", "recurrent", "transformer", "foundation"]
+
+# Import name -> what to type when it is missing. The two differ often enough
+# ("pip install granite-tsfm" for `tsfm_public`) that guessing is no help.
+LIBRARIES = {
+    "statsforecast":  ("statsforecast", "pip install statsforecast"),
+    "neuralforecast": ("neuralforecast", "pip install neuralforecast"),
+    "arch":           ("arch", "pip install arch"),
+    "chronos":        ("chronos", "pip install chronos-forecasting"),
+    "timesfm":        ("timesfm", "pip install timesfm"),
+    "uni2ts":         ("uni2ts", "pip install uni2ts"),
+    "kronos":         ("kronos", "see the Kronos repository - not on PyPI"),
+    "granite-tsfm":   ("tsfm_public", "pip install granite-tsfm"),
+    "sp500bench":     ("sp500bench", "pip install -e ."),
+}
+
+# Models with a working executor. Everything else in the registry is reported
+# as pending rather than skipped in silence.
+EXECUTORS = {"Naive": naive_forecast_fold}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run one or more tiers of the frozen model roster."
     )
-    parser.add_argument(
-        "--tier", action="append", dest="tiers", choices=TIERS, metavar="TIER",
-        help=f"tier to run; repeatable. One of: {', '.join(TIERS)}",
-    )
-    parser.add_argument(
-        "--models-config", default=str(ROOT / "configs" / "models.yaml"),
-        help="frozen roster specification (default: configs/models.yaml)",
-    )
-    parser.add_argument(
-        "--eval-config", default=str(ROOT / "configs" / "eval.yaml"),
-        help="frozen evaluation specification (default: configs/eval.yaml)",
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="run the configuration gate, print the resolved roster, and stop",
-    )
+    parser.add_argument("--tier", action="append", dest="tiers", choices=TIERS,
+                        metavar="TIER",
+                        help=f"tier to run; repeatable. One of: {', '.join(TIERS)}")
+    parser.add_argument("--models-config", default=None,
+                        help="frozen roster specification (default: configs/models.yaml)")
+    parser.add_argument("--eval-config", default=None,
+                        help="frozen evaluation specification (default: configs/eval.yaml)")
+    parser.add_argument("--features", default=str(ROOT / "data" / "features.parquet"),
+                        help="panel written by scripts/build_features.py")
+    parser.add_argument("--out", default=str(ROOT / "forecasts"),
+                        help="forecast root (default: forecasts/)")
+    parser.add_argument("--timings", default=str(ROOT / "results" / "timings.json"),
+                        help="wall-clock log (default: results/timings.json)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="run the configuration gate, print the roster, and stop")
     return parser.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# Configuration gate
-# ---------------------------------------------------------------------------
-
-def assert_quantile_grids_agree(models_cfg: dict, eval_cfg: dict) -> list[float]:
-    """The training grid and the evaluation grid must be the same list.
-
-    Equality is required element for element, in order - not as sets. The grid
-    is the axis CRPS is averaged over, and a reordering would mean the two files
-    no longer describe the same object even where they hold the same levels.
-    """
-    training = models_cfg["training"]["quantiles"]
-    evaluation = eval_cfg["quantiles"]
-
-    if training != evaluation:
-        missing = sorted(set(evaluation) - set(training))
-        extra = sorted(set(training) - set(evaluation))
-        detail = ""
-        if missing:
-            detail += (
-                f"\n  levels scored but never trained: {missing}\n"
-                "    MQLoss emits only the levels it was trained on, so every\n"
-                "    neuralforecast model would be unable to supply these."
-            )
-        if extra:
-            detail += f"\n  levels trained but never scored: {extra}"
-        if not missing and not extra:
-            detail = "\n  same levels, different order - the grids must match in order too."
-        raise SystemExit(
-            "\nquantile grids disagree.\n"
-            f"  configs/models.yaml  training.quantiles : {training}\n"
-            f"  configs/eval.yaml    quantiles          : {evaluation}"
-            f"{detail}\n\n"
-            "  CRPS is the pinball loss averaged over this grid. Averages taken\n"
-            "  over different grids are not comparable, so a roster split across\n"
-            "  two grids cannot be ranked on CRPS at all. Fix the configs; do not\n"
-            "  work around this at evaluation time."
-        )
-    return list(training)
-
-
-def assert_point_forecast_is_available(grid: list[float], eval_cfg: dict) -> None:
-    """The level the point forecast is read from has to be in the grid."""
-    source = eval_cfg["point_forecast_from"]
-    if source != "median":
-        raise SystemExit(
-            f"eval.yaml sets point_forecast_from to {source!r}; this script "
-            "reads the point forecast from the median."
-        )
-    if 0.5 not in grid:
-        raise SystemExit(
-            f"point_forecast_from is 'median' but 0.5 is not in the quantile "
-            f"grid {grid}. Every point metric - RMSE, MAE, MASE, directional "
-            "accuracy - and the whole backtest read that column."
-        )
-
-
-def load_configs(models_path: str, eval_path: str) -> tuple[dict, dict, list[float]]:
-    """Load both frozen specifications and refuse to proceed if they disagree."""
-    with open(models_path) as fh:
-        models_cfg = yaml.safe_load(fh)
-    with open(eval_path) as fh:
-        eval_cfg = yaml.safe_load(fh)
-
-    grid = assert_quantile_grids_agree(models_cfg, eval_cfg)
-    assert_point_forecast_is_available(grid, eval_cfg)
-    return models_cfg, eval_cfg, grid
+def library_available(library: str) -> tuple[bool, str]:
+    module, how = LIBRARIES.get(library, (library, f"pip install {library}"))
+    return importlib.util.find_spec(module) is not None, how
 
 
 def resolve_roster(tiers: list[str] | None) -> list[ModelSpec]:
@@ -157,36 +101,158 @@ def resolve_roster(tiers: list[str] | None) -> list[ModelSpec]:
     return [m for m in REGISTRY if m.tier in wanted]
 
 
-# ---------------------------------------------------------------------------
+def partition(roster: list[ModelSpec]) -> tuple[list[ModelSpec], list[tuple[ModelSpec, str]]]:
+    """Split the roster into what can run now and what cannot, with reasons."""
+    runnable, skipped = [], []
+    for spec in roster:
+        available, how = library_available(spec.library)
+        if not available:
+            skipped.append((spec, f"library {spec.library!r} not installed - {how}"))
+        elif spec.name not in EXECUTORS:
+            skipped.append((spec, "no executor implemented yet"))
+        else:
+            runnable.append(spec)
+    return runnable, skipped
+
+
+def record_timing(path: Path, model: str, payload: dict) -> None:
+    """Merge one model's wall-clock into results/timings.json.
+
+    Merged rather than overwritten so tiers run on different days, on different
+    machines, accumulate into one file. Axis 5 of the evaluation is compute cost,
+    and it cannot be reconstructed after the fact.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            print(f"  ! {path} is not valid JSON; starting a fresh record")
+    existing[model] = payload
+    path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n")
+
+
+def run_model(
+    spec: ModelSpec,
+    panel: pd.DataFrame,
+    walk_forward: PurgedWalkForward,
+    quantiles: tuple[float, ...],
+    out_root: Path,
+    timings_path: Path,
+) -> None:
+    executor = EXECUTORS[spec.name]
+    model_dir = out_root / spec.name
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{spec.name}  ({spec.library}, {spec.scope})")
+    fold_times: dict[str, float] = {}
+    rows_written = 0
+    started = time.perf_counter()
+
+    for split, train, test in walk_forward.iter_frames(panel, time_col="ds"):
+        # iter_frames already runs this before yielding. Repeated here because
+        # the guard is the point of the fold structure, and a future refactor
+        # that loosens iter_frames should not be able to loosen the runner too.
+        assert_no_overlap(
+            train["ds"], test["ds"],
+            horizon=walk_forward.horizon,
+            embargo=walk_forward.embargo,
+            calendar=pd.DatetimeIndex(panel["ds"].unique()).sort_values(),
+        )
+
+        t0 = time.perf_counter()
+        forecasts = executor(
+            panel=panel, train=train,
+            test_start=split.test_start, test_end=split.test_end,
+            quantiles=quantiles, target_col="y",
+        )
+        elapsed = time.perf_counter() - t0
+
+        path = model_dir / f"{split.fold}.parquet"
+        forecasts.to_parquet(path, index=False)
+        fold_times[str(split.fold)] = round(elapsed, 3)
+        rows_written += len(forecasts)
+
+        print(f"  fold {split.fold}  train<=|{split.train_end.date()}| "
+              f"test=[{split.test_start.date()} .. {split.test_end.date()}]  "
+              f"{len(train):>7,} train rows -> {len(forecasts):>6,} forecasts  "
+              f"{elapsed:6.2f}s  {path.relative_to(ROOT)}")
+
+    total = time.perf_counter() - started
+    record_timing(timings_path, spec.name, {
+        "library": spec.library,
+        "tier": spec.tier,
+        "scope": spec.scope,
+        "seconds_total": round(total, 3),
+        "seconds_per_fold": fold_times,
+        "n_forecasts": rows_written,
+        "n_folds": len(fold_times),
+        "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    })
+    print(f"  {rows_written:,} forecasts in {total:.2f}s "
+          f"-> {timings_path.relative_to(ROOT)}")
+
 
 def main() -> None:
     args = parse_args()
-    models_cfg, eval_cfg, grid = load_configs(args.models_config, args.eval_config)
+    try:
+        cfg = load_configs(
+            args.models_config or ROOT / "configs" / "models.yaml",
+            args.eval_config or ROOT / "configs" / "eval.yaml",
+        )
+    except ConfigError as exc:
+        raise SystemExit(str(exc))
 
-    print(f"models.yaml v{models_cfg['version']}  eval.yaml v{eval_cfg['version']}")
-    print(f"quantile grid ({len(grid)} levels, training == evaluation): {grid}")
-    print(f"point forecast: {eval_cfg['point_forecast_from']} (q0.5)")
+    print(f"models.yaml v{cfg.models['version']}  eval.yaml v{cfg.evaluation['version']}")
+    print(f"quantile grid ({len(cfg.quantiles)} levels, training == evaluation): "
+          f"{list(cfg.quantiles)}")
+    print(f"point forecast: {cfg.evaluation['point_forecast_from']} ({cfg.median_column})")
 
     roster = resolve_roster(args.tiers)
     scope = ", ".join(args.tiers) if args.tiers else "all tiers"
-    print(f"\nroster: {len(roster)} of {len(REGISTRY)} models ({scope})")
-    print(f"\n{'model':<22}{'tier':<14}{'library':<16}{'scope'}")
-    print("-" * 62)
-    for m in roster:
-        print(f"{m.name:<22}{m.tier:<14}{m.library:<16}{m.scope}")
-
     if not roster:
-        raise SystemExit(f"\nno models match {scope}")
+        raise SystemExit(f"no models match {scope}")
+    runnable, skipped = partition(roster)
+
+    print(f"\nroster: {len(roster)} of {len(REGISTRY)} models ({scope})")
+    print(f"  runnable now : {', '.join(m.name for m in runnable) or 'none'}")
+    for spec, reason in skipped:
+        print(f"  skip {spec.name:<20} {reason}")
 
     if args.dry_run:
         print("\nDry run - configuration gate passed, nothing executed.")
         return
+    if not runnable:
+        raise SystemExit("\nnothing to run")
 
-    raise SystemExit(
-        "\nThe model execution layer is not implemented yet.\n"
-        "  The configuration gate above passed. Re-run with --dry-run to check\n"
-        "  the specification without this error."
+    features = Path(args.features)
+    if not features.exists():
+        raise SystemExit(
+            f"missing panel: {features}\n"
+            "  run: python scripts/build_features.py --config configs/data.yaml"
+        )
+    panel = pd.read_parquet(features, columns=["unique_id", "ds", "target"])
+    panel = panel.rename(columns={"target": "y"}).sort_values(["unique_id", "ds"])
+
+    data_cfg = load_data_config()
+    walk_forward = PurgedWalkForward(
+        test_windows=cfg.test_windows,
+        horizon=cfg.horizon,
+        embargo=cfg.embargo,
+        train_start=data_cfg["splits"]["train"]["start"],
     )
+    print(f"\npanel: {len(panel):,} rows, {panel['unique_id'].nunique()} tickers, "
+          f"{panel['ds'].nunique():,} sessions "
+          f"[{panel['ds'].min().date()} .. {panel['ds'].max().date()}]")
+    print(f"folds: {len(cfg.test_windows)}, purge {cfg.horizon} + embargo "
+          f"{cfg.embargo} = {walk_forward.gap} sessions excised per fold")
+
+    out_root, timings_path = Path(args.out), Path(args.timings)
+    for spec in runnable:
+        run_model(spec, panel, walk_forward, cfg.quantiles, out_root, timings_path)
+
+    print("\nDone.")
 
 
 if __name__ == "__main__":

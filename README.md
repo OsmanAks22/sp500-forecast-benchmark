@@ -334,13 +334,14 @@ src/sp500bench/
   data/           universe, yfinance download, FRED with release lags
   features/       causal feature construction, regime labelling
   evaluation/     purged CV, metrics, DM + BH-FDR + DSR
-  models/         uniform registry over all four tiers
+  config.py       loads and cross-checks the frozen specification
+  models/         uniform registry over all four tiers, Tier 0 baselines
   backtest/       cost-aware simulation
 tests/            leakage (28) + numerical (13) + MCS/HAR/robust-SE (21)
-                  + backtest cost accounting (18)
+                  + backtest cost accounting (18) + config gate (8)
 scripts/          pipeline entry points — build_dataset, build_features and
-                  the run_experiment config gate are written; the model
-                  execution layer is not
+                  run_experiment are written; run_experiment executes Naive
+                  only, and reports every other model as pending
 ```
 
 ## Reproducing
