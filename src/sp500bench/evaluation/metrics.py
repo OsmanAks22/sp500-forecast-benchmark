@@ -18,6 +18,8 @@ import numpy as np
 
 __all__ = [
     "directional_accuracy_ci",
+    "directional_accuracy_with_ci",
+    "directional_hits",
     "rmse",
     "mae",
     "mase",
@@ -70,18 +72,57 @@ def mase(
     return float(np.mean(np.abs(y_true - y_pred)) / denom)
 
 
+def directional_hits(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    dates: "pd.Series | np.ndarray | None" = None,
+) -> tuple[np.ndarray, "np.ndarray | None"]:
+    """Per-observation hit indicator, with the zero-outcome convention applied once.
+
+    Zero-valued outcomes are *dropped* rather than counted as agreement. On daily
+    equity returns exact zeros are rare but real - halted names, and low-priced
+    names that close unchanged - and ``np.sign(0) == np.sign(anything)`` is false,
+    so scoring them would silently count every flat day as a miss and drag the
+    statistic below its true value.
+
+    This function is the single definition of that convention. Both
+    :func:`directional_accuracy` and :func:`directional_accuracy_with_ci` go
+    through it, so a point estimate and its confidence interval are computed from
+    the same vector by construction and cannot drift apart. They did drift once:
+    the point estimate dropped flat days while a hand-built hits vector passed to
+    :func:`directional_accuracy_ci` scored them as misses, and the two reported
+    49.79% and 49.62% for the same forecasts.
+
+    Returns ``(hits, dates)``, where ``dates`` is ``None`` if none was supplied
+    and otherwise the matching subset - filtered by the same mask, in the same
+    order, so the caller cannot misalign them either.
+    """
+    y_true = np.asarray(y_true, dtype=float).ravel()
+    y_pred = np.asarray(y_pred, dtype=float).ravel()
+    if y_true.shape != y_pred.shape:
+        raise ValueError(f"shape mismatch: {y_true.shape} vs {y_pred.shape}")
+
+    keep = np.isfinite(y_true) & np.isfinite(y_pred) & (y_true != 0)
+    hits = (np.sign(y_true[keep]) == np.sign(y_pred[keep])).astype(float)
+
+    if dates is None:
+        return hits, None
+    dates = np.asarray(dates).ravel()
+    if dates.shape != keep.shape:
+        raise ValueError(f"dates length {dates.shape} does not match {keep.shape}")
+    return hits, dates[keep]
+
+
 def directional_accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     """Share of periods where the sign of the forecast matches the outcome.
 
-    Zero-valued outcomes are dropped rather than counted as agreement; on daily
-    equity returns exact zeros are rare but they do occur on halted names, and
-    counting them inflates the statistic.
+    Zero-valued outcomes are dropped rather than counted as agreement; see
+    :func:`directional_hits`, which owns that convention.
     """
-    y_true, y_pred = _clean(y_true, y_pred)
-    nz = y_true != 0
-    if nz.sum() == 0:
+    hits, _ = directional_hits(y_true, y_pred)
+    if hits.size == 0:
         return float("nan")
-    return float(np.mean(np.sign(y_true[nz]) == np.sign(y_pred[nz])))
+    return float(np.mean(hits))
 
 
 def pinball_loss(y_true: np.ndarray, y_pred_q: np.ndarray, q: float) -> float:
@@ -218,3 +259,31 @@ def directional_accuracy_ci(
         "n_obs": float(n_obs),
         "min_detectable_effect": float(1.96 * se_clustered),
     }
+
+
+def directional_accuracy_with_ci(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    dates: "pd.Series | np.ndarray",
+    **kwargs,
+) -> dict[str, float]:
+    """Directional accuracy and its date-clustered interval, from one hit vector.
+
+    The reason to prefer this over calling :func:`directional_accuracy` and
+    :func:`directional_accuracy_ci` separately: those two take different
+    arguments - outcomes and forecasts on one side, a pre-built hit vector on the
+    other - and the caller is left to apply the zero-outcome convention twice,
+    consistently. Here it is applied once, in :func:`directional_hits`, so
+    ``estimate`` is the same number :func:`directional_accuracy` returns.
+
+    ``kwargs`` are forwarded to :func:`directional_accuracy_ci` (``n_boot``,
+    ``block_size``, ``alpha``, ``seed``).
+    """
+    import pandas as pd
+
+    hits, kept_dates = directional_hits(y_true, y_pred, dates)
+    if hits.size == 0:
+        return {k: float("nan") for k in
+                ("estimate", "ci_low", "ci_high", "se_naive", "se_clustered",
+                 "variance_inflation", "n_days", "n_obs", "min_detectable_effect")}
+    return directional_accuracy_ci(pd.Series(hits), pd.Series(kept_dates), **kwargs)

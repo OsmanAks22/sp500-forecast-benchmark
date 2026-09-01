@@ -7,14 +7,14 @@ and evaluation quantile grids disagree - resolves the tiers named on the command
 line against :data:`sp500bench.models.registry.REGISTRY`, and runs them over the
 purged walk-forward folds from ``configs/eval.yaml``.
 
-Only ``Naive`` has an executor so far. Every other model in a selected tier is
+Only the Tier 0 baselines have executors so far. Every other model in a selected tier is
 reported and skipped, rather than silently omitted: a run that quietly produces
 fewer forecast files than the roster has models is how a missing model becomes a
 missing row in a results table nobody questions.
 
 Outputs
 -------
-``forecasts/{model}/{fold}.parquet``  unique_id, ds, one column per quantile
+``forecasts/{model}/fold_{k}.parquet``  unique_id, ds, one column per quantile
 ``results/timings.json``              per-model wall-clock, for the compute axis
 
 Usage
@@ -42,7 +42,8 @@ if str(ROOT / "src") not in sys.path:
 from sp500bench.config import (ConfigError, load_configs,  # noqa: E402
                                load_data_config)
 from sp500bench.evaluation.splits import PurgedWalkForward, assert_no_overlap  # noqa: E402
-from sp500bench.models.baselines import naive_forecast_fold  # noqa: E402
+from sp500bench.models.baselines import (naive_forecast_fold,  # noqa: E402
+                                         rwd_forecast_fold, warmup_statsforecast)
 from sp500bench.models.registry import REGISTRY, ModelSpec  # noqa: E402
 
 TIERS = ["baseline", "statistical", "linear", "recurrent", "transformer", "foundation"]
@@ -63,7 +64,14 @@ LIBRARIES = {
 
 # Models with a working executor. Everything else in the registry is reported
 # as pending rather than skipped in silence.
-EXECUTORS = {"Naive": naive_forecast_fold}
+EXECUTORS = {
+    "Naive": naive_forecast_fold,
+    "RandomWalkWithDrift": rwd_forecast_fold,
+}
+
+# Libraries that JIT-compile on first use. Warming one up before the clock
+# starts keeps compilation out of fold 0's time; see warmup_statsforecast.
+WARMUPS = {"statsforecast": warmup_statsforecast}
 
 
 def parse_args() -> argparse.Namespace:
@@ -140,12 +148,29 @@ def run_model(
     quantiles: tuple[float, ...],
     out_root: Path,
     timings_path: Path,
+    warmed: set[str],
 ) -> None:
     executor = EXECUTORS[spec.name]
     model_dir = out_root / spec.name
     model_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{spec.name}  ({spec.library}, {spec.scope})")
+
+    # Warm-up first, and outside the fold clock. statsforecast compiles on first
+    # use; folded into fold 0 it reads as 20s of model cost against 0.2s for
+    # every fold after it, which would rank a random walk slower than AutoARIMA
+    # on the compute axis. Charged once, to whichever model runs first in the
+    # process, and reported on its own line.
+    warmup_seconds = 0.0
+    warmup_charged = spec.library not in warmed
+    if warmup_charged and spec.library in WARMUPS:
+        t0 = time.perf_counter()
+        WARMUPS[spec.library]()
+        warmup_seconds = time.perf_counter() - t0
+        warmed.add(spec.library)
+        print(f"  warm-up  {spec.library} JIT compile  {warmup_seconds:6.2f}s "
+              "(excluded from fold times)")
+
     fold_times: dict[str, float] = {}
     rows_written = 0
     started = time.perf_counter()
@@ -169,7 +194,7 @@ def run_model(
         )
         elapsed = time.perf_counter() - t0
 
-        path = model_dir / f"{split.fold}.parquet"
+        path = model_dir / f"fold_{split.fold}.parquet"
         forecasts.to_parquet(path, index=False)
         fold_times[str(split.fold)] = round(elapsed, 3)
         rows_written += len(forecasts)
@@ -179,18 +204,29 @@ def run_model(
               f"{len(train):>7,} train rows -> {len(forecasts):>6,} forecasts  "
               f"{elapsed:6.2f}s  {path.relative_to(ROOT)}")
 
-    total = time.perf_counter() - started
+    steady = sum(fold_times.values())
     record_timing(timings_path, spec.name, {
         "library": spec.library,
         "tier": spec.tier,
         "scope": spec.scope,
-        "seconds_total": round(total, 3),
+        "seconds_warmup": round(warmup_seconds, 3),
+        "warmup_charged_here": warmup_charged,
         "seconds_per_fold": fold_times,
+        "seconds_steady_state_total": round(steady, 3),
+        "seconds_steady_state_mean": round(steady / len(fold_times), 3) if fold_times else None,
+        "seconds_wall_clock_total": round(time.perf_counter() - started + warmup_seconds, 3),
         "n_forecasts": rows_written,
         "n_folds": len(fold_times),
+        "warmup_note": (
+            "seconds_warmup is one-off library JIT compilation, not model cost. It "
+            "is charged to the first model that uses the library in a process; a "
+            "later model in the same process shows 0.0 with warmup_charged_here "
+            "false. Compare models on seconds_steady_state_total."
+        ),
         "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     })
-    print(f"  {rows_written:,} forecasts in {total:.2f}s "
+    print(f"  {rows_written:,} forecasts | steady state {steady:.2f}s "
+          f"({steady / len(fold_times):.2f}s/fold) | warm-up {warmup_seconds:.2f}s "
           f"-> {timings_path.relative_to(ROOT)}")
 
 
@@ -249,8 +285,9 @@ def main() -> None:
           f"{cfg.embargo} = {walk_forward.gap} sessions excised per fold")
 
     out_root, timings_path = Path(args.out), Path(args.timings)
+    warmed: set[str] = set()
     for spec in runnable:
-        run_model(spec, panel, walk_forward, cfg.quantiles, out_root, timings_path)
+        run_model(spec, panel, walk_forward, cfg.quantiles, out_root, timings_path, warmed)
 
     print("\nDone.")
 

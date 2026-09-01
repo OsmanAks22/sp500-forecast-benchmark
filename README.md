@@ -337,11 +337,12 @@ src/sp500bench/
   config.py       loads and cross-checks the frozen specification
   models/         uniform registry over all four tiers, Tier 0 baselines
   backtest/       cost-aware simulation
-tests/            leakage (28) + numerical (13) + MCS/HAR/robust-SE (21)
+tests/            leakage (28) + numerical (17) + MCS/HAR/robust-SE (21)
                   + backtest cost accounting (18) + config gate (8)
-scripts/          pipeline entry points — build_dataset, build_features and
-                  run_experiment are written; run_experiment executes Naive
-                  only, and reports every other model as pending
+scripts/          pipeline entry points — build_dataset, build_features,
+                  run_experiment and evaluate are written; run_experiment
+                  executes the Tier 0 baselines only and reports every other
+                  model as pending
 ```
 
 ## Reproducing

@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from sp500bench.evaluation.metrics import (crps_from_quantiles, directional_accuracy,
+                                           directional_accuracy_with_ci, directional_hits,
                                            mase, picp, pinball_loss, rmse)
 from sp500bench.evaluation.stat_tests import (benjamini_hochberg, deflated_sharpe_ratio,
                                               diebold_mariano, expected_max_sharpe)
@@ -118,3 +120,59 @@ def test_directional_accuracy_ignores_flat_days():
 def test_rmse_is_zero_for_a_perfect_forecast():
     y = np.array([1.0, 2.0, 3.0])
     assert rmse(y, y) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# The zero-outcome convention has to be applied in exactly one place
+# ---------------------------------------------------------------------------
+
+def test_point_estimate_and_ci_agree_when_outcomes_contain_exact_zeros():
+    """The headline number and its interval must come from the same hit vector.
+
+    Regression test. ``directional_accuracy`` drops flat days; a hand-built hit
+    vector passed to ``directional_accuracy_ci`` scored them as misses, because
+    ``np.sign(0) == np.sign(x)`` is false. The two disagreed by 0.17pp on the
+    Naive baseline - small, but it is the difference between a statistic and two
+    statistics wearing the same name.
+    """
+    rng = np.random.default_rng(20260901)
+    n = 6_000
+    y = rng.normal(0, 0.02, n)
+    y[rng.choice(n, 400, replace=False)] = 0.0          # flat days, ~7%
+    pred = rng.normal(0, 0.02, n)
+    dates = pd.Series(np.repeat(pd.date_range("2020-01-01", periods=n // 10), 10))
+
+    point = directional_accuracy(y, pred)
+    with_ci = directional_accuracy_with_ci(y, pred, dates, n_boot=400)
+
+    assert with_ci["estimate"] == point, (
+        f"CI estimate {with_ci['estimate']!r} != point estimate {point!r}"
+    )
+    assert with_ci["n_obs"] == n - 400, "flat days must be dropped, not scored"
+    assert with_ci["ci_low"] <= point <= with_ci["ci_high"]
+
+
+def test_directional_hits_drops_zeros_and_keeps_dates_aligned():
+    y = np.array([0.01, 0.0, -0.02, 0.03, 0.0])
+    pred = np.array([0.5, 0.5, 0.5, -0.5, -0.5])
+    dates = pd.Series(pd.date_range("2020-01-01", periods=5))
+
+    hits, kept = directional_hits(y, pred, dates)
+    assert hits.tolist() == [1.0, 0.0, 0.0], "only the three non-zero outcomes score"
+    assert list(kept) == list(dates[[0, 2, 3]]), "dates must be filtered by the same mask"
+
+    bare, none_dates = directional_hits(y, pred)
+    assert none_dates is None and bare.tolist() == hits.tolist()
+
+
+def test_directional_hits_rejects_misaligned_dates():
+    y = np.array([0.01, -0.02, 0.03])
+    pred = np.array([0.5, 0.5, 0.5])
+    with pytest.raises(ValueError):
+        directional_hits(y, pred, pd.Series(pd.date_range("2020-01-01", periods=2)))
+
+
+def test_a_forecast_that_is_always_flat_scores_no_hits():
+    """sign(0) matches nothing, so a constant-zero forecast cannot score."""
+    y = np.array([0.01, -0.02, 0.03, -0.01])
+    assert directional_accuracy(y, np.zeros(4)) == 0.0
