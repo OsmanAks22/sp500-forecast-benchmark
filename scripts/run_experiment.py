@@ -7,7 +7,7 @@ and evaluation quantile grids disagree - resolves the tiers named on the command
 line against :data:`sp500bench.models.registry.REGISTRY`, and runs them over the
 purged walk-forward folds from ``configs/eval.yaml``.
 
-Only the Tier 0 baselines have executors so far. Every other model in a selected tier is
+Only Tier 0 and Tier 1 have executors so far. Every other model in a selected tier is
 reported and skipped, rather than silently omitted: a run that quietly produces
 fewer forecast files than the roster has models is how a missing model becomes a
 missing row in a results table nobody questions.
@@ -36,6 +36,16 @@ from pathlib import Path
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def show(path: Path) -> str:
+    """Repo-relative when it is inside the repo, absolute otherwise."""
+    try:
+        return str(Path(path).resolve().relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
@@ -44,7 +54,14 @@ from sp500bench.config import (ConfigError, load_configs,  # noqa: E402
 from sp500bench.evaluation.splits import PurgedWalkForward, assert_no_overlap  # noqa: E402
 from sp500bench.models.baselines import (naive_forecast_fold,  # noqa: E402
                                          rwd_forecast_fold, warmup_statsforecast)
+from sp500bench.models.statistical import (autoarima_forecast_fold,  # noqa: E402
+                                           autoets_forecast_fold)
+from sp500bench.models.volatility_arm import (build_volatility_panel,  # noqa: E402
+                                              gjr_garch_forecast_fold,
+                                              har_forecast_fold,
+                                              log_har_forecast_fold)
 from sp500bench.models.registry import REGISTRY, ModelSpec  # noqa: E402
+from sp500bench.models.volatility_arm import RV_WINDOW  # noqa: E402
 
 TIERS = ["baseline", "statistical", "linear", "recurrent", "transformer", "foundation"]
 
@@ -67,6 +84,12 @@ LIBRARIES = {
 EXECUTORS = {
     "Naive": naive_forecast_fold,
     "RandomWalkWithDrift": rwd_forecast_fold,
+    "AutoARIMA": autoarima_forecast_fold,
+    "AutoETS": autoets_forecast_fold,
+    # Volatility arm - a different target, so a different panel; see load_panels.
+    "HAR-RV": har_forecast_fold,
+    "Log-HAR": log_har_forecast_fold,
+    "GJR-GARCH": gjr_garch_forecast_fold,
 }
 
 # Libraries that JIT-compile on first use. Warming one up before the clock
@@ -81,12 +104,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tier", action="append", dest="tiers", choices=TIERS,
                         metavar="TIER",
                         help=f"tier to run; repeatable. One of: {', '.join(TIERS)}")
+    parser.add_argument("--model", action="append", dest="models", metavar="NAME",
+                        help="restrict to these registry names; repeatable. Combined "
+                             "with --tier as an intersection.")
     parser.add_argument("--models-config", default=None,
                         help="frozen roster specification (default: configs/models.yaml)")
     parser.add_argument("--eval-config", default=None,
                         help="frozen evaluation specification (default: configs/eval.yaml)")
     parser.add_argument("--features", default=str(ROOT / "data" / "features.parquet"),
                         help="panel written by scripts/build_features.py")
+    parser.add_argument("--bars", default=str(ROOT / "data" / "processed" / "panel.parquet"),
+                        help="OHLCV panel, for the volatility arm's Yang-Zhang target")
     parser.add_argument("--out", default=str(ROOT / "forecasts"),
                         help="forecast root (default: forecasts/)")
     parser.add_argument("--timings", default=str(ROOT / "results" / "timings.json"),
@@ -96,17 +124,31 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def is_volatility_model(spec: ModelSpec) -> bool:
+    """Volatility-arm models forecast 21-day realised volatility, not returns.
+
+    They take the same folds and the same quantile grid but a different panel,
+    and they are never ranked against a return model.
+    """
+    return spec.params.get("target") == "volatility"
+
+
 def library_available(library: str) -> tuple[bool, str]:
     module, how = LIBRARIES.get(library, (library, f"pip install {library}"))
     return importlib.util.find_spec(module) is not None, how
 
 
-def resolve_roster(tiers: list[str] | None) -> list[ModelSpec]:
+def resolve_roster(tiers: list[str] | None,
+                   names: list[str] | None = None) -> list[ModelSpec]:
     """Select from the registry, which is the source of truth for the roster."""
-    if not tiers:
-        return list(REGISTRY)
-    wanted = set(tiers)
-    return [m for m in REGISTRY if m.tier in wanted]
+    roster = REGISTRY if not tiers else [m for m in REGISTRY if m.tier in set(tiers)]
+    if names:
+        known = {m.name for m in REGISTRY}
+        unknown = sorted(set(names) - known)
+        if unknown:
+            raise SystemExit(f"not in the registry: {unknown}\n  known: {sorted(known)}")
+        roster = [m for m in roster if m.name in set(names)]
+    return list(roster)
 
 
 def partition(roster: list[ModelSpec]) -> tuple[list[ModelSpec], list[tuple[ModelSpec, str]]]:
@@ -202,13 +244,14 @@ def run_model(
         print(f"  fold {split.fold}  train<=|{split.train_end.date()}| "
               f"test=[{split.test_start.date()} .. {split.test_end.date()}]  "
               f"{len(train):>7,} train rows -> {len(forecasts):>6,} forecasts  "
-              f"{elapsed:6.2f}s  {path.relative_to(ROOT)}")
+              f"{elapsed:6.2f}s  {show(path)}")
 
     steady = sum(fold_times.values())
     record_timing(timings_path, spec.name, {
         "library": spec.library,
         "tier": spec.tier,
         "scope": spec.scope,
+        "target": spec.params.get("target", "return"),
         "seconds_warmup": round(warmup_seconds, 3),
         "warmup_charged_here": warmup_charged,
         "seconds_per_fold": fold_times,
@@ -227,7 +270,7 @@ def run_model(
     })
     print(f"  {rows_written:,} forecasts | steady state {steady:.2f}s "
           f"({steady / len(fold_times):.2f}s/fold) | warm-up {warmup_seconds:.2f}s "
-          f"-> {timings_path.relative_to(ROOT)}")
+          f"-> {show(timings_path)}")
 
 
 def main() -> None:
@@ -245,8 +288,10 @@ def main() -> None:
           f"{list(cfg.quantiles)}")
     print(f"point forecast: {cfg.evaluation['point_forecast_from']} ({cfg.median_column})")
 
-    roster = resolve_roster(args.tiers)
+    roster = resolve_roster(args.tiers, args.models)
     scope = ", ".join(args.tiers) if args.tiers else "all tiers"
+    if args.models:
+        scope += f" | models: {', '.join(args.models)}"
     if not roster:
         raise SystemExit(f"no models match {scope}")
     runnable, skipped = partition(roster)
@@ -271,6 +316,23 @@ def main() -> None:
     panel = pd.read_parquet(features, columns=["unique_id", "ds", "target"])
     panel = panel.rename(columns={"target": "y"}).sort_values(["unique_id", "ds"])
 
+    volatility_panel = None
+    if any(is_volatility_model(spec) for spec in runnable):
+        bars_path = Path(args.bars)
+        if not bars_path.exists():
+            raise SystemExit(
+                f"missing OHLCV panel: {bars_path}\n"
+                "  the volatility arm needs bars for the Yang-Zhang estimator\n"
+                "  run: python scripts/build_dataset.py --config configs/data.yaml")
+        bars = pd.read_parquet(bars_path,
+                               columns=["unique_id", "ds", "open", "high", "low", "close"])
+        volatility_panel = build_volatility_panel(bars)
+        usable = volatility_panel["y"].notna().sum()
+        print(f"volatility panel: {len(volatility_panel):,} rows, "
+              f"{usable:,} with a {RV_WINDOW}-session Yang-Zhang target "
+              f"[{volatility_panel['ds'].min().date()} .. "
+              f"{volatility_panel['ds'].max().date()}]")
+
     data_cfg = load_data_config()
     walk_forward = PurgedWalkForward(
         test_windows=cfg.test_windows,
@@ -287,7 +349,9 @@ def main() -> None:
     out_root, timings_path = Path(args.out), Path(args.timings)
     warmed: set[str] = set()
     for spec in runnable:
-        run_model(spec, panel, walk_forward, cfg.quantiles, out_root, timings_path, warmed)
+        target_panel = volatility_panel if is_volatility_model(spec) else panel
+        run_model(spec, target_panel, walk_forward, cfg.quantiles, out_root,
+                  timings_path, warmed)
 
     print("\nDone.")
 

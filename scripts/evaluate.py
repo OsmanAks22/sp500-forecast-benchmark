@@ -2,8 +2,10 @@
 """Score the forecasts and write the results table the tests read from.
 
 Step four of the pipeline. It reads ``forecasts/{model}/fold_{k}.parquet``, joins
-the outcome and the regime labels, and writes one row per model x fold x regime
-cell to ``results/metrics.parquet``.
+the outcome and the regime labels, and writes two tables:
+
+``results/metrics.parquet``  one row per model x fold x regime cell
+``results/losses.parquet``   one row per model x ticker x session x loss type
 
 Why a table rather than numbers on a terminal
 ---------------------------------------------
@@ -48,7 +50,8 @@ from sp500bench.evaluation.metrics import (crps_from_quantiles,  # noqa: E402
                                            directional_accuracy_with_ci, mae,
                                            mean_interval_score, picp, rmse)
 from sp500bench.evaluation.splits import PurgedWalkForward  # noqa: E402
-from sp500bench.models.registry import REGISTRY  # noqa: E402
+from sp500bench.models.registry import BY_NAME, REGISTRY  # noqa: E402
+from sp500bench.models.volatility_arm import build_volatility_panel  # noqa: E402
 
 # Below this many distinct sessions the block bootstrap is resampling too few
 # blocks to mean anything, so the interval is written as null rather than as a
@@ -63,12 +66,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--forecasts", default=str(ROOT / "forecasts"))
     p.add_argument("--features", default=str(ROOT / "data" / "features.parquet"))
     p.add_argument("--regimes", default=str(ROOT / "data" / "regimes.parquet"))
+    p.add_argument("--bars", default=str(ROOT / "data" / "processed" / "panel.parquet"),
+                   help="OHLCV panel, for the volatility arm's Yang-Zhang target")
     p.add_argument("--out", default=str(ROOT / "results" / "metrics.parquet"))
+    p.add_argument("--losses-out", default=str(ROOT / "results" / "losses.parquet"))
     p.add_argument("--models", action="append", default=None,
                    help="restrict to these models; repeatable (default: all found)")
     p.add_argument("--n-boot", type=int, default=5_000,
                    help="bootstrap replications for the directional-accuracy CI")
     return p.parse_args()
+
+
+def arm_of(model: str) -> str:
+    """Which target a model forecasts: the return arm or the volatility arm.
+
+    The two arms are scored against different panels and are never ranked
+    against each other - an RMSE on 1-day log returns and an RMSE on 21-day
+    realised volatility are not the same quantity and do not belong in one
+    ordering. The ``arm`` column exists so a downstream consumer cannot pool
+    them by accident.
+    """
+    spec = BY_NAME.get(model)
+    if spec is not None and spec.params.get("target") == "volatility":
+        return "volatility"
+    return "return"
 
 
 def load_forecasts(root: Path, model: str, folds: list[int]) -> pd.DataFrame:
@@ -105,7 +126,8 @@ def mase_denominators(panel: pd.DataFrame, walk_forward: PurgedWalkForward,
     return out
 
 
-def cell_metrics(cell: pd.DataFrame, cfg, denominators, n_boot: int) -> dict:
+def cell_metrics(cell: pd.DataFrame, cfg, denominators, n_boot: int,
+                 arm: str = "return") -> dict:
     """Every metric named in configs/eval.yaml, for one cell."""
     empty = {k: float("nan") for k in
              ("rmse", "mae", "mase", "directional_accuracy", "da_ci_low", "da_ci_high",
@@ -130,7 +152,13 @@ def cell_metrics(cell: pd.DataFrame, cfg, denominators, n_boot: int) -> dict:
     mase_value = (float(np.average(scaled, weights=weights)) if scaled else float("nan"))
 
     n_days = int(cell["ds"].nunique())
-    if n_days >= MIN_DAYS_FOR_CI:
+    if arm == "volatility":
+        # Realised volatility is positive by construction, so the sign of the
+        # forecast always matches the sign of the outcome and directional
+        # accuracy is identically 1. Left null rather than written as a perfect
+        # score that means nothing.
+        da = {}
+    elif n_days >= MIN_DAYS_FOR_CI:
         da = directional_accuracy_with_ci(y, point, cell["ds"], n_boot=n_boot)
     else:
         # Too few sessions for the block bootstrap to say anything; the point
@@ -164,8 +192,52 @@ def cell_metrics(cell: pd.DataFrame, cfg, denominators, n_boot: int) -> dict:
     }
 
 
+def build_losses(model: str, scored: pd.DataFrame, cfg) -> pd.DataFrame:
+    """Per-observation losses in long form, for the DM tests and the MCS.
+
+    One row per model x ticker x session x loss type. ``squared_error`` and
+    ``absolute_error`` feed the point-forecast comparisons; the ``pinball_q*``
+    rows feed CRPS, whose cell value is twice their mean over the grid; ``hit``
+    feeds directional accuracy.
+
+    ``hit`` is null on sessions whose outcome is exactly zero. That is the same
+    convention :func:`~sp500bench.evaluation.metrics.directional_hits` applies,
+    and writing null rather than 0.0 is what keeps a downstream mean from
+    silently scoring flat days as misses.
+    """
+    y = scored["y"].to_numpy(dtype=float)
+    point = scored[cfg.median_column].to_numpy(dtype=float)
+
+    losses = {
+        "squared_error": (y - point) ** 2,
+        "absolute_error": np.abs(y - point),
+    }
+    for q, column in zip(cfg.quantiles, cfg.quantile_columns):
+        delta = y - scored[column].to_numpy(dtype=float)
+        losses[f"pinball_{column}"] = np.maximum(q * delta, (q - 1.0) * delta)
+
+    hit = np.where(np.sign(y) == np.sign(point), 1.0, 0.0)
+    hit[y == 0] = np.nan
+    losses["hit"] = hit
+
+    keys = scored[["unique_id", "ds", "fold"]]
+    frames = []
+    for loss_type, values in losses.items():
+        frame = keys.copy()
+        frame["loss_type"] = loss_type
+        frame["value"] = values
+        frames.append(frame)
+
+    out = pd.concat(frames, ignore_index=True)
+    out.insert(0, "arm", arm_of(model))
+    out.insert(0, "model", model)
+    out["loss_type"] = out["loss_type"].astype("category")
+    return out
+
+
 def build_rows(model: str, scored: pd.DataFrame, cfg, denominators, folds,
                n_boot: int) -> list[dict]:
+    arm = arm_of(model)
     rows = []
     scopes = [(None, scored)] + [(f, scored[scored["fold"] == f]) for f in folds]
 
@@ -177,10 +249,11 @@ def build_rows(model: str, scored: pd.DataFrame, cfg, denominators, folds,
         for kind, label, cell in cells:
             rows.append({
                 "model": model,
+                "arm": arm,
                 "fold": pd.NA if fold is None else int(fold),
                 "regime_kind": kind,
                 "regime": label,
-                **cell_metrics(cell, cfg, denominators, n_boot),
+                **cell_metrics(cell, cfg, denominators, n_boot, arm),
             })
     return rows
 
@@ -198,7 +271,55 @@ def _ordered(frame: pd.DataFrame) -> pd.DataFrame:
     return frame.sort_values(["_order", "model"]).drop(columns="_order")
 
 
+def print_volatility_arm(table: pd.DataFrame, reference: str = "Log-HAR") -> None:
+    """The volatility arm, read against Log-HAR.
+
+    Log-HAR is the reference because it is the benchmark the literature says
+    foundation models fail to beat (Brini, 2026), so it is the number every
+    later entrant on this arm has to clear. Ratios below 1.00 on RMSE and CRPS
+    beat it; PICP80 is read against the nominal 80%, not against the reference.
+    """
+    arm = _ordered(table[(table.arm == "volatility") & (table.regime_kind == "all")])
+    if arm.empty:
+        return
+
+    print("\n" + "=" * 96)
+    print(f"VOLATILITY ARM - 21-session Yang-Zhang realised volatility, "
+          f"read against {reference}")
+    print("=" * 96)
+    head = (f"{'window':<26}{'model':<12}{'n':>8}{'MASE':>8}{'RMSE':>10}{'vs ref':>8}"
+            f"{'CRPS':>10}{'vs ref':>8}{'PICP80':>9}")
+    print(head)
+    print("-" * len(head))
+
+    order = arm["fold"].astype("float").fillna(np.inf)
+    for position, (_, block) in enumerate(arm.groupby(order, sort=True)):
+        if position:
+            print()
+        label = _window_label(block.iloc[0])
+        ref = block[block.model == reference]
+        ref_rmse = float(ref["rmse"].iloc[0]) if len(ref) else float("nan")
+        ref_crps = float(ref["crps"].iloc[0]) if len(ref) else float("nan")
+        for _, r in block.sort_values("model").iterrows():
+            marker = "  <- ref" if r["model"] == reference else ""
+            print(f"{label:<26}{r['model']:<12}{r['n_obs']:>8,}{r['mase']:>8.3f}"
+                  f"{r['rmse']:>10.5f}{r['rmse'] / ref_rmse:>8.2f}"
+                  f"{r['crps']:>10.5f}{r['crps'] / ref_crps:>8.2f}"
+                  f"{r['picp_80'] * 100:>8.1f}%{marker}")
+            label = ""
+
+    print("\nRatios are model / reference; below 1.00 beats the reference.")
+    print("Directional accuracy is omitted: realised volatility is positive, so the")
+    print("sign always matches and the statistic is identically 1.")
+    print("The target is a TRAILING 21-session window, so 20 of its 21 sessions are")
+    print("already observed at forecast time. Errors are correspondingly small -")
+    print("read the arm as a ranking, not as evidence that volatility is easy.")
+
+
 def print_comparison(table: pd.DataFrame) -> None:
+    table = table[table.arm == "return"]
+    if table.empty:
+        return
     overall = _ordered(table[table.regime_kind == "all"])
 
     print("\n" + "=" * 92)
@@ -280,24 +401,35 @@ def main() -> None:
 
     forecast_root = Path(args.forecasts)
     wanted = args.models or [m.name for m in REGISTRY]
-    denominators = mase_denominators(panel, walk_forward, splits)
+    present = [m for m in wanted if not load_forecasts(forecast_root, m, folds).empty]
+
+    # Two arms, two targets, two panels. Built only if that arm has forecasts.
+    panels = {"return": panel}
+    denominators = {"return": mase_denominators(panel, walk_forward, splits)}
+    if any(arm_of(m) == "volatility" for m in present):
+        bars = pd.read_parquet(args.bars,
+                               columns=["unique_id", "ds", "open", "high", "low", "close"])
+        vol_panel = build_volatility_panel(bars)[["unique_id", "ds", "y"]]
+        panels["volatility"] = vol_panel
+        denominators["volatility"] = mase_denominators(vol_panel, walk_forward, splits)
 
     print(f"quantile grid: {list(cfg.quantiles)}  point forecast: {cfg.median_column}")
     print(f"bootstrap: {args.n_boot:,} replications, clustered on dates\n")
 
-    rows = []
-    for model in wanted:
+    rows, loss_frames = [], []
+    for model in present:
+        arm = arm_of(model)
         forecasts = load_forecasts(forecast_root, model, folds)
-        if forecasts.empty:
-            continue
         scored = (forecasts
-                  .merge(panel, on=["unique_id", "ds"], how="left", validate="one_to_one")
+                  .merge(panels[arm], on=["unique_id", "ds"], how="left",
+                         validate="one_to_one")
                   .merge(regimes, left_on="ds", right_index=True, how="left"))
         missing = int(scored["y"].isna().sum())
         if missing:
             raise SystemExit(f"{model}: {missing} forecasts have no outcome to score against")
-        print(f"  {model:<22} {len(scored):>7,} forecasts over {len(folds)} folds")
-        rows.extend(build_rows(model, scored, cfg, denominators, folds, args.n_boot))
+        print(f"  {model:<22} {arm:<11} {len(scored):>7,} forecasts over {len(folds)} folds")
+        rows.extend(build_rows(model, scored, cfg, denominators[arm], folds, args.n_boot))
+        loss_frames.append(build_losses(model, scored, cfg))
 
     if not rows:
         raise SystemExit(
@@ -310,8 +442,17 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     table.to_parquet(out, index=False)
 
+    losses = pd.concat(loss_frames, ignore_index=True)
+    losses["fold"] = losses["fold"].astype("int16")
+    losses_out = Path(args.losses_out)
+    losses.to_parquet(losses_out, index=False)
+
     print_comparison(table)
+    print_volatility_arm(table)
     print(f"\n{len(table)} cells -> {out.relative_to(ROOT)}")
+    print(f"{len(losses):,} per-observation losses "
+          f"({losses['loss_type'].nunique()} types x {losses['model'].nunique()} models) "
+          f"-> {losses_out.relative_to(ROOT)}")
 
 
 if __name__ == "__main__":
