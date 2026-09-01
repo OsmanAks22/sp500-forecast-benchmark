@@ -7,7 +7,8 @@
 # foundation checkpoints and added the HAR volatility arm, both of which the
 # registry already carried. Version 3 adds TTM to Tier 3 and GJR-GARCH to the
 # volatility arm - both pre-registered, both locked before any model was run.
-version: 3
+# Version 4 aligns training.quantiles to the densified evaluation grid.
+version: 4
 
 tier_0_baselines:              # proposal
   - {name: Naive,               lib: statsforecast, cost: negligible}
@@ -104,7 +105,13 @@ volatility_arm:
 
 training:
   loss: MQLoss
-  quantiles: [0.1, 0.25, 0.5, 0.75, 0.9]
+  # Must be identical to `quantiles` in configs/eval.yaml, element for element.
+  # An MQLoss model emits exactly the levels it was trained on, so a training
+  # grid narrower than the evaluation grid would leave the seven neuralforecast
+  # models unable to produce the tail levels CRPS is scored on - and CRPS
+  # averaged over different grids is not comparable across models. The two
+  # grids are checked for equality at load time in scripts/run_experiment.py.
+  quantiles: [0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]
   hyperparameters: published_defaults
   tuning:
     enabled: true

@@ -154,7 +154,7 @@ insufficient.
 | Embargo | 5 sessions | Absorbs residual serial correlation. |
 | Folds | 4 expanding windows | Annual refit. 78 daily refits would cost 20× the compute for no extra insight. |
 | Scaling | per ticker, train statistics only | |
-| Loss | `MQLoss`, q ∈ {0.1, 0.25, 0.5, 0.75, 0.9} | Median is the point forecast — one training run serves both. |
+| Loss | `MQLoss`, q ∈ {0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99} | Median is the point forecast — one training run serves both. Identical to the evaluation grid, and checked at load time. |
 
 ## The nineteen models
 
@@ -338,7 +338,9 @@ src/sp500bench/
   backtest/       cost-aware simulation
 tests/            leakage (28) + numerical (13) + MCS/HAR/robust-SE (21)
                   + backtest cost accounting (18)
-scripts/          pipeline entry points — not yet written
+scripts/          pipeline entry points — build_dataset, build_features and
+                  the run_experiment config gate are written; the model
+                  execution layer is not
 ```
 
 ## Reproducing
