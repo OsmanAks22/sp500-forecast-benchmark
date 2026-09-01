@@ -59,6 +59,27 @@ predictive distributions than ARIMA/ETS, whose Gaussian intervals cannot
 represent the fat tails and volatility clustering of daily equity returns.
 *Expected outcome: reject the null - a genuine difference.*
 
+*Benchmark recorded 1 September 2026, after the Tier 0 baselines were run and
+before any competing model.* H2 is a claim about calibration, so the number it
+is measured against is fixed here rather than chosen later. Both baselines carry
+an empirical-residual predictive distribution fitted on each fold's training
+window, and both undercover the nominal 80% band:
+
+| window | PICP80 | CRPS |
+|---|---:|---:|
+| fold 0 · 2020 | 62.4% | 0.01665 |
+| fold 1 · 2021 | 81.7% | 0.00770 |
+| fold 2 · 2022 | 69.0% | 0.01032 |
+| fold 3 · 2023–26 | 80.0% | 0.00836 |
+| **pooled test period** | **75.9%** | **0.00981** |
+
+Naive and RandomWalkWithDrift agree to three decimals on every cell. The pooled
+shortfall — 75.9% against 80% nominal — is the benchmark; the 2020 figure of
+62.4% is the harder one, and the more informative, because it is where a band
+fitted on calmer training data fails. A model claiming better calibration under
+H2 has to beat both, and beating the pooled figure while missing 2020 is a
+result about quiet markets, not about calibration.
+
 **H3 (primary).** Model rankings are not stable across volatility and drawdown
 regimes; aggregate metrics conceal regime-specific failure.
 
@@ -69,6 +90,60 @@ mid-vol and 715 high-vol sessions — but the drawdown axis is thin at the tail:
 cell will be wide, and a model that looks best there may simply be the one that
 happened to fit 73 days. Any `bear` result is reported with its interval and
 treated as indicative, never as a ranking.
+
+*Scope narrowed 1 September 2026, after the Tier 0 baselines were run and before
+any competing model. The per-fold counts below were checked against the regime
+panel before they entered this document.* **The directional axis of H3 is
+reported descriptively only. No hypothesis test is run on the `bear` cell.**
+
+The 73 bear sessions are two episodes, not a sample of bear regimes:
+
+| fold | window | bear sessions | episode |
+|---|---|---:|---|
+| 0 | 2020 | 18 | COVID crash, 12 Mar – 7 Apr 2020 |
+| 1 | 2021 | 0 | — |
+| 2 | 2022 | 54 | rate-driven bear, 13 Jun – 28 Dec 2022 |
+| 3 | 2023–26 | 1 | 3 Jan 2023, the tail of the 2022 episode |
+
+The two episodes are not two draws from one population. March 2020 was a fast
+liquidity shock — a near-vertical drawdown over four weeks, with volatility
+arriving faster than any conditioning variable could track it. June to December
+2022 was a slow rate repricing: a six-month grind at moderate daily volatility,
+driven by discount-rate expectations rather than by a scramble for liquidity.
+A forecasting model can plausibly do well in one and badly in the other for
+reasons that have nothing to do with a common factor called `bear`.
+
+The consequence for inference is the sample size. Within an episode, consecutive
+sessions are highly dependent — that is what makes it an episode — so the
+effective sample is closer to **2** than to 73. The date-clustered bootstrap
+does not repair this: block resampling over dates assumes many exchangeable
+blocks, and two contiguous runs supply about two. An interval computed there
+would be a number, not evidence.
+
+So the narrowing rests on this, and not on a claim that replication is
+impossible: it is available, in one comparison. **Any inferential claim about
+the `bear` cell would generalise from n = 2 episodes**, and two episodes of
+structurally different kinds. Results for the cell are reported with their
+counts and read descriptively.
+
+**H3's inferential claim therefore rests on the volatility axis** — and within
+it, on the `high_vol` versus `mid_vol` contrast, which is the only pairing
+genuinely spread across the design:
+
+| fold | low_vol | mid_vol | high_vol |
+|---|---:|---:|---:|
+| 0 · 2020 | 18 | 18 | 217 |
+| 1 · 2021 | 0 | 157 | 95 |
+| 2 · 2022 | 0 | 21 | 230 |
+| 3 · 2023–26 | 176 | 565 | 173 |
+
+`high_vol` appears in all four folds (217/95/230/173), and `mid_vol` in all
+four, so a ranking that reverses between them can be checked for replication
+fold by fold. `low_vol` cannot carry that weight: 194 sessions sounds
+comfortable, but it is **absent from folds 1 and 2 entirely and 91%
+concentrated in fold 3**, which makes it closer to a single late-period episode
+than to a regime observed throughout. Low-vol results are reported with their
+intervals and carry the same caveat as the drawdown axis, in weaker form.
 
 The decision **not** to merge `correction` and `bear` into one drawdown bucket
 was taken on the same date, before any results existed. Merging would buy
@@ -335,14 +410,17 @@ src/sp500bench/
   features/       causal feature construction, regime labelling
   evaluation/     purged CV, metrics, DM + BH-FDR + DSR
   config.py       loads and cross-checks the frozen specification
-  models/         uniform registry over all four tiers, Tier 0 baselines
+  models/         uniform registry over all four tiers; Tier 0 baselines and
+                  Tier 1 statistical share one statsforecast driver
   backtest/       cost-aware simulation
 tests/            leakage (28) + numerical (17) + MCS/HAR/robust-SE (21)
                   + backtest cost accounting (18) + config gate (8)
 scripts/          pipeline entry points — build_dataset, build_features,
                   run_experiment and evaluate are written; run_experiment
-                  executes the Tier 0 baselines only and reports every other
-                  model as pending
+                  executes Tiers 0 and 1 and reports every other model as
+                  pending
+results/          metrics.parquet (model x fold x regime cells), losses.parquet
+                  (per-observation losses for DM and the MCS), timings.json
 ```
 
 ## Reproducing
