@@ -1,4 +1,4 @@
-version: 1
+version: 2
 
 cross_validation:
   scheme: purged_expanding_walk_forward
@@ -10,7 +10,13 @@ cross_validation:
     - ["2022-01-01", "2022-12-31"]   # rate-driven bear
     - ["2023-01-01", "2026-08-25"]   # recovery and expansion
 
-quantiles: [0.1, 0.25, 0.5, 0.75, 0.9]
+# Nine levels, densified from the original five in version 2. The 5-point grid
+# carried no level beyond 0.1/0.9, so the pinball average behind CRPS was blind
+# to the tails - which on daily equity returns is where the distributional
+# information sits. H2 is a calibration hypothesis, so the old grid was
+# measuring the hypothesis blind. The median is unchanged and remains the point
+# forecast, so H1 and the backtest are untouched by this.
+quantiles: [0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]
 point_forecast_from: median
 
 metrics:

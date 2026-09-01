@@ -79,7 +79,7 @@ the one registered. The thresholds in `features/regimes.py` are unchanged.
 
 **H4 (primary).** The apparent advantage of pre-trained foundation models
 narrows on the clean slice that post-dates their pre-training cutoff.
-*Only Kronos has a documented cutoff (June 2024); for the others this is a
+*Only Kronos has a documented cutoff (June 2024); for the other four this is a
 limitation, not a controlled comparison.*
 
 *Scope narrowed 26 August 2026, before any model was run.* **H4 is tested on
@@ -156,7 +156,7 @@ insufficient.
 | Scaling | per ticker, train statistics only | |
 | Loss | `MQLoss`, q ∈ {0.1, 0.25, 0.5, 0.75, 0.9} | Median is the point forecast — one training run serves both. |
 
-## The seventeen models
+## The nineteen models
 
 | Tier | Models | Scope | Source |
 |---|---|---|---|
@@ -165,8 +165,8 @@ insufficient.
 | 2a · Linear DL | **DLinear, NLinear** | global | added |
 | 2b · Recurrent | LSTM, GRU | global | proposal |
 | 2c · Transformer | PatchTST, TFT, TimesNet | global | proposal |
-| 3 · Foundation | **Chronos-2, TimesFM-2.5, Moirai-2.0, Kronos-small** | zero-shot | added |
-| V · Volatility arm | **HAR-RV, Log-HAR** | local | added |
+| 3 · Foundation | **Chronos-2, TimesFM-2.5, Moirai-2.0, Kronos-small, TTM** | zero-shot | added |
+| V · Volatility arm | **HAR-RV, Log-HAR, GJR-GARCH** | local | added |
 
 **Why second-generation foundation models.** Chronos-Bolt and the 2024-era
 checkpoints are one generation behind as of August 2026. Chronos-2, TimesFM-2.5
@@ -174,6 +174,18 @@ and Moirai-2.0 are the models the current literature ranks highest.
 
 **Why HAR-RV is not optional.** It is the field-standard volatility benchmark.
 Any volatility claim made without it is indefensible.
+
+**Why GJR-GARCH was added.** The HAR cascade regresses on unsigned realised
+variance over daily, weekly and monthly windows, so it is structurally blind to
+the sign of the shock and cannot represent the leverage effect. GJR-GARCH(1,1)
+with skew-t innovations can. Without it the volatility arm would test HAR
+against models that share HAR's blind spot.
+
+**Why TTM was added.** Brini (2026) reports TinyTimeMixers as the only TSFM to
+beat Log-HAR at every horizon, by 1.3-1.8%. That is the single strongest claim
+in the literature this study is positioned against, and it is cited in H5. TTM
+is included as a direct replication probe: if the margin does not reproduce on
+this panel, the discrepancy is a finding in its own right.
 
 **Compute sacrifice, designated in advance.** If the Kaggle quota binds, the
 annual refits of TimesNet are cut first — the trained deep models dominate GPU
@@ -203,7 +215,7 @@ certainly seen these tickers over 2020–2025.
 
 The protocol:
 
-1. Report full-test-period results for all seventeen models, with foundation
+1. Report full-test-period results for all nineteen models, with foundation
    models flagged as potentially contaminated.
 2. Repeat the entire comparison on the clean slice.
 3. Report the gap between the two as a finding in its own right.

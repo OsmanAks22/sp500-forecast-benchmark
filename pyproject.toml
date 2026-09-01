@@ -18,6 +18,7 @@ dependencies = [
 full = [
     "statsforecast",
     "neuralforecast",
+    "arch",
     "yfinance",
     "fredapi",
     "pyarrow",

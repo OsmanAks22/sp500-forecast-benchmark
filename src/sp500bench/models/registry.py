@@ -4,7 +4,7 @@ Every model, from a random walk to a 100M-parameter pre-trained transformer,
 exposes the same two calls::
 
     model.fit(train_panel)
-    model.predict(test_panel) -> DataFrame[unique_id, ds, q0.1 ... q0.9]
+    model.predict(test_panel) -> DataFrame[unique_id, ds, q0.01 ... q0.99]
 
 That uniformity is what makes the comparison fair: the evaluation layer cannot
 accidentally give one family an easier path than another, because it cannot tell
@@ -89,6 +89,13 @@ REGISTRY: list[ModelSpec] = [
                "pretrain_cutoff": "2024-06",
                "context_limit": 512,
                "us_equities_in_distribution": True}),
+    ModelSpec("TTM", "foundation", "granite-tsfm", "zero_shot", True, False,
+              "ADDED. TinyTimeMixers (IBM Granite), a sub-1M-parameter MLP-Mixer TSFM. "
+              "Direct replication probe: Brini (2026) reports TTM as the only TSFM to "
+              "beat Log-HAR at every horizon, by 1.3-1.8%. If that margin does not "
+              "reproduce here, the discrepancy is the finding.",
+              {"checkpoint": "ibm-granite/granite-timeseries-ttm-r2",
+               "pretrain_cutoff": "undocumented"}),
 
     # Volatility arm only - the mandatory econometric benchmark.
     ModelSpec("HAR-RV", "statistical", "sp500bench", "local", True, False,
@@ -98,10 +105,20 @@ REGISTRY: list[ModelSpec] = [
               "ADDED. The benchmark most TSFMs fail to beat (Brini, 2026). "
               "Smearing correction applied on back-transform.",
               {"target": "volatility"}),
+    ModelSpec("GJR-GARCH", "statistical", "arch", "local", True, False,
+              "ADDED. GJR-GARCH(1,1) with skew-t innovations. Captures the leverage "
+              "effect - a negative return raises next-session volatility more than a "
+              "positive return of the same size - which the HAR cascade cannot "
+              "represent, since HAR regresses on unsigned realised variance over "
+              "daily/weekly/monthly windows and is blind to the sign of the shock. "
+              "Skew-t innovations also give the conditional density a fat left tail, "
+              "so the arm is not conceding the new 0.01/0.05 eval levels to Gaussian "
+              "HAR quantiles by construction.",
+              {"target": "volatility"}),
 ]
 
 # Pre-training cutoffs are documented only for Kronos (June 2024, stated in the
-# paper's Appendix D). For the other three the cutoff is undocumented, which is
+# paper's Appendix D). For the other four the cutoff is undocumented, which is
 # itself a reportable finding: without it, no zero-shot comparison on recent data
 # can be certified contamination-free.
 CLEAN_SLICE_VALID_FOR = {"Kronos-small"}
