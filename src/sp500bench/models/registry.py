@@ -91,8 +91,13 @@ REGISTRY: list[ModelSpec] = [
               "ADDED. Current SOTA generic TSFM; native quantile + covariate support.",
               {"checkpoint": "amazon/chronos-2", "pretrain_cutoff": "undocumented"}),
     ModelSpec("TimesFM-2.5", "foundation", "timesfm", "zero_shot", True, False,
-              "ADDED. Decoder-only, patch-based, continuous quantile head.",
+              "ADDED. Decoder-only, patch-based, continuous quantile head. The "
+              "entry point is timesfm.TimesFM3Forecaster - NOT timesfm.TimesFm, "
+              "which does not exist in the installed release and cost one Kaggle "
+              "smoke-test run to discover. Recorded here so the real run does not "
+              "rediscover it.",
               {"checkpoint": "google/timesfm-2.5-200m-pytorch",
+               "entry_point": "timesfm.TimesFM3Forecaster",
                "pretrain_cutoff": "undocumented"}),
     ModelSpec("Moirai-2.0", "foundation", "uni2ts", "zero_shot", True, False,
               "ADDED. Decoder-only with multi-token prediction; top GIFT-Eval ranking.",

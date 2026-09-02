@@ -61,9 +61,13 @@ tier_3_foundation:
   - name: TimesFM-2.5
     lib: timesfm
     checkpoint: google/timesfm-2.5-200m-pytorch
+    entry_point: timesfm.TimesFM3Forecaster
     mode: zero_shot
     pretrain_cutoff: undocumented
-    note: "Decoder-only, patch-based, continuous quantile head."
+    note: "Decoder-only, patch-based, continuous quantile head. Entry point is
+           TimesFM3Forecaster, not TimesFm - the latter does not exist in the
+           installed release. Confirmed on Kaggle 2 September 2026; the module
+           namespace also carries TimesFM3Torch and TimesFM_2p5_200M_torch."
   - name: Moirai-2.0
     lib: uni2ts
     checkpoint: Salesforce/moirai-2.0-R-small
