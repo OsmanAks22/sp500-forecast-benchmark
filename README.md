@@ -259,6 +259,90 @@ insufficient.
 
 ---
 
+## Results to date
+
+**Recorded 2 September 2026, on eight models: Tier 0, Tier 1 and the volatility
+arm. No GPU tier has been run.** Twelve models remain — the linear, recurrent and
+transformer tiers, and the five foundation models — and every number below is
+subject to revision when they land. It is recorded now so that the position
+before those runs is timestamped rather than reconstructed afterwards.
+
+Reproduce with `make evaluate` then `python scripts/analyse.py`; all figures come
+from `results/inference.parquet`.
+
+### H1 — the falsification criterion is not met
+
+The pooled return-arm Model Confidence Set is **{ZeroReturn, AutoETS}** at
+α = 0.10, over 1,669 sessions.
+
+| model | MCS p | in set |
+|---|---:|---|
+| AutoETS | 0.691 | yes |
+| **ZeroReturn** | 0.691 | **yes** |
+| AutoARIMA | 0.0004 | no |
+| LastReturn | 0.0000 | no |
+| RandomWalkWithDrift | 0.0000 | no |
+
+The random walk survives, so no model enters the set as a strict subset
+excluding it. **Criterion (a) fails, and criterion (b) — break-even above 5 bps
+round trip — therefore does not come into play.** The same holds in every
+volatility regime cell: `high_vol`, `mid_vol` and `low_vol` all return
+{ZeroReturn, AutoETS}.
+
+- **AutoETS is statistically indistinguishable from a constant zero forecast.**
+  Diebold-Mariano on daily cross-sectional MSE: p = 0.718, loss ratio 0.9997.
+- **AutoARIMA is eliminated for being worse**, at a loss ratio of 1.009. Its
+  pooled DM does not survive BH on its own (p = 0.065, BH-adjusted 0.087), but
+  the MCS eliminates it at p = 0.0004, and it is significantly worse in folds 2
+  and 3 after BH (adjusted p = 0.0040 and 0.0029). The two procedures agree on
+  the direction and the MCS is the one the criterion is written against.
+- LastReturn and RandomWalkWithDrift sit at a loss ratio of 2.12 — the
+  double-differencing penalty described under H1, not a modelling result.
+
+This is the outcome H1 registered in advance.
+
+### H3 — first inferential result, on the volatility axis
+
+The volatility arm separates by regime, and it separates in the direction that
+is easy to get backwards:
+
+| regime | sessions | MCS |
+|---|---:|---|
+| `high_vol` | 714 | **all three survive** — GJR-GARCH, HAR-RV, Log-HAR, p = 0.706 |
+| `mid_vol` | 741 | **Log-HAR only** — GJR-GARCH and HAR-RV eliminated at p = 0.0002 |
+
+**The separation appears in calm markets, not turbulent ones.** In high
+volatility the data cannot distinguish the three; in mid volatility Log-HAR is
+alone in the set. `low_vol` reproduces the `mid_vol` pattern (Log-HAR only,
+others at p = 0.0006 and 0.0016) but is reported rather than treated as
+inferential, per the H3 scope note. The `bear` cell is descriptive only, as
+registered.
+
+### A methodological finding: the cost of ignoring cross-sectional dependence
+
+Every test above runs on the **daily cross-sectional mean squared error** — one
+row per session, averaged across the 50 tickers. Run instead on the stacked
+83,450-row ticker-day panel, the same comparisons read:
+
+| comparison | p, daily (used) | p, stacked (diagnostic) |
+|---|---:|---:|
+| AutoARIMA vs ZeroReturn, pooled | 0.065 | 1.5 × 10⁻⁹ |
+| HAR-RV vs Log-HAR, pooled | 0.352 | 4.5 × 10⁻⁶ |
+| GJR-GARCH vs Log-HAR, pooled | 0.234 | 1.3 × 10⁻⁴ |
+
+Both of the first two would have been reported as decisive by a study that
+stacks. Neither is. Fifty constituents share a market factor, so stacking treats
+50 correlated observations as 50 independent ones and shrinks the standard error
+by roughly `sqrt(50)`. This is the same inflation the directional-accuracy
+bootstrap measures at about 2× *after* collapsing to days.
+
+**The stacked column is a diagnostic and is never a result.** It exists to size
+the error, and no decision anywhere in this study uses it. It is carried in
+`results/inference.parquet` as `dm_p_stacked`, named so it cannot be mistaken
+for the figure that was tested.
+
+---
+
 ## What the design does *not* claim
 
 - **Not a trading strategy.** The backtest exists to price the forecast in
