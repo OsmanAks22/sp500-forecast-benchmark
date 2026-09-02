@@ -54,6 +54,40 @@ S&P 500 log returns, once leakage is purged, cross-sectional dependence is
 respected, and multiple testing is corrected. *Expected outcome: fail to reject
 the null.*
 
+*Benchmark identified 2 September 2026, after Tiers 0 and 1 were run and before
+any hypothesis test.* **The random-walk benchmark H1 names is `ZeroReturn`.** A
+random walk in *prices* implies an expected return of zero, so the forecast is
+zero at every session.
+
+This had been implemented as `statsforecast`'s `Naive`, which on a return series
+predicts `y[t+1] = y[t]` — a different model. The target is already a first
+difference of log prices, so predicting the previous return differences it a
+second time and inflates the error by `sqrt(2(1-rho))`, where `rho` is the lag-1
+autocorrelation of returns. On this panel `rho = -0.059`, so the factor is 1.455
+— and the measured ratio is 1.455. The wrong benchmark made AutoARIMA look 31%
+better than "the random walk"; against the correct one it is 0.5% *worse*.
+
+The old model is kept as `LastReturn`, named for what it does, and reported as a
+diagnostic of what a spurious lag costs. It is never the H1 reference.
+
+`ZeroReturn`'s directional accuracy is reported as n/a rather than 0%. Its
+forecast is identically zero, `sign(0)` matches nothing, and the convention that
+drops flat *outcomes* does not drop flat *forecasts* — so the mechanical 0% is
+an artefact of the statistic, not a directional failure. A random walk makes no
+directional call; that is the point of it.
+
+*Reading the scaled errors.* On a return target, MASE's no-skill line is **not
+1.0**. Its denominator is the in-sample `mean |y_t - y_{t-1}|`, which differences
+an already-differenced series, so a zero forecast scores about
+`1/sqrt(2(1-rho))` — **0.707 at `rho = 0`**, 0.687 at the `rho` measured here —
+before any train-versus-test volatility difference is taken into account. A
+model at 0.77 is therefore *not* beating the benchmark by 23%. A second scaled
+error is reported alongside it, dividing by the in-sample `mean |y_t|` instead;
+its no-skill line is 1.0 and it can be read directly. Both appear in
+`results/metrics.parquet` as `mase` and `scaled_error_mad`. In either case the
+operative comparison is the `ZeroReturn` row itself, which absorbs the
+volatility difference between the training and test windows.
+
 **H2 (primary).** Modern probabilistic models produce better-calibrated
 predictive distributions than ARIMA/ETS, whose Gaussian intervals cannot
 represent the fat tails and volatility clustering of daily equity returns.
@@ -231,11 +265,11 @@ insufficient.
 | Scaling | per ticker, train statistics only | |
 | Loss | `MQLoss`, q ∈ {0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99} | Median is the point forecast — one training run serves both. Identical to the evaluation grid, and checked at load time. |
 
-## The nineteen models
+## The twenty models
 
 | Tier | Models | Scope | Source |
 |---|---|---|---|
-| 0 · Baseline | Naive, RandomWalkWithDrift | local | proposal |
+| 0 · Baseline | **ZeroReturn** (H1 reference), **LastReturn**, RandomWalkWithDrift | local | proposal + added |
 | 1 · Statistical | AutoARIMA, AutoETS | local | proposal |
 | 2a · Linear DL | **DLinear, NLinear** | global | added |
 | 2b · Recurrent | LSTM, GRU | global | proposal |
@@ -290,7 +324,7 @@ certainly seen these tickers over 2020–2025.
 
 The protocol:
 
-1. Report full-test-period results for all nineteen models, with foundation
+1. Report full-test-period results for all twenty models, with foundation
    models flagged as potentially contaminated.
 2. Repeat the entire comparison on the clean slice.
 3. Report the gap between the two as a finding in its own right.
@@ -415,6 +449,7 @@ src/sp500bench/
   backtest/       cost-aware simulation
 tests/            leakage (28) + numerical (17) + MCS/HAR/robust-SE (21)
                   + backtest cost accounting (18) + config gate (8)
+                  + H1 benchmark identity (5)
 scripts/          pipeline entry points — build_dataset, build_features,
                   run_experiment and evaluate are written; run_experiment
                   executes Tiers 0 and 1 and reports every other model as

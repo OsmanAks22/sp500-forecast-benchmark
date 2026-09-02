@@ -52,8 +52,9 @@ if str(ROOT / "src") not in sys.path:
 from sp500bench.config import (ConfigError, load_configs,  # noqa: E402
                                load_data_config)
 from sp500bench.evaluation.splits import PurgedWalkForward, assert_no_overlap  # noqa: E402
-from sp500bench.models.baselines import (naive_forecast_fold,  # noqa: E402
-                                         rwd_forecast_fold, warmup_statsforecast)
+from sp500bench.models.baselines import (last_return_forecast_fold,  # noqa: E402
+                                         rwd_forecast_fold, warmup_statsforecast,
+                                         zero_return_forecast_fold)
 from sp500bench.models.statistical import (autoarima_forecast_fold,  # noqa: E402
                                            autoets_forecast_fold)
 from sp500bench.models.volatility_arm import (build_volatility_panel,  # noqa: E402
@@ -82,7 +83,8 @@ LIBRARIES = {
 # Models with a working executor. Everything else in the registry is reported
 # as pending rather than skipped in silence.
 EXECUTORS = {
-    "Naive": naive_forecast_fold,
+    "ZeroReturn": zero_return_forecast_fold,
+    "LastReturn": last_return_forecast_fold,
     "RandomWalkWithDrift": rwd_forecast_fold,
     "AutoARIMA": autoarima_forecast_fold,
     "AutoETS": autoets_forecast_fold,

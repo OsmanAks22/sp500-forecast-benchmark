@@ -106,23 +106,40 @@ def load_forecasts(root: Path, model: str, folds: list[int]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
-def mase_denominators(panel: pd.DataFrame, walk_forward: PurgedWalkForward,
-                      splits) -> dict[tuple[int, str], float]:
-    """In-sample naive MAE per (fold, ticker), from that fold's training window.
+def scale_denominators(panel: pd.DataFrame, walk_forward: PurgedWalkForward,
+                       splits) -> dict[tuple[int, str], tuple[float, float]]:
+    """Two in-sample scaling denominators per (fold, ticker), from training only.
 
-    MASE divides by the error a naive forecast makes *in training*, so the
-    denominator has to come from the same purged window the model was fitted on.
-    Using one global denominator instead would quietly rescale every fold by the
-    same number and hide exactly the regime effect H3 asks about.
+    ``(mase_denominator, mad_denominator)``:
+
+    * ``mase_denominator`` is ``mean |y_t - y_{t-1}|``, the in-sample error of a
+      seasonal-naive forecast, which is what standard MASE divides by.
+    * ``mad_denominator`` is ``mean |y_t|``, the in-sample mean absolute level.
+
+    Both come from the same purged window the model was fitted on. Using one
+    global denominator would rescale every fold by the same number and hide the
+    regime effect H3 asks about.
+
+    Why two. On a *return* target MASE is easy to misread. The target is already
+    the first difference of log prices, so the MASE denominator differences it a
+    second time and is inflated by ``sqrt(2(1-rho))`` relative to the level of
+    the series. The zero forecast - the actual random-walk benchmark - therefore
+    scores a MASE near ``1/sqrt(2) ~ 0.707`` rather than 1.0, and a model at 0.77
+    is *not* beating the benchmark by 23%. The MAD-scaled error has no-skill 1.0
+    on this target, so it can be read directly. Report both.
     """
-    out: dict[tuple[int, str], float] = {}
+    out: dict[tuple[int, str], tuple[float, float]] = {}
     for split in splits:
         train = panel[(panel["ds"] >= walk_forward.train_start)
                       & (panel["ds"] <= split.train_end)]
         for ticker, group in train.groupby("unique_id", sort=True):
-            diff = np.abs(np.diff(group.sort_values("ds")["y"].to_numpy()))
-            diff = diff[np.isfinite(diff)]
-            out[(split.fold, ticker)] = float(np.mean(diff)) if diff.size else float("nan")
+            values = group.sort_values("ds")["y"].to_numpy()
+            values = values[np.isfinite(values)]
+            diff = np.abs(np.diff(values))
+            out[(split.fold, ticker)] = (
+                float(np.mean(diff)) if diff.size else float("nan"),
+                float(np.mean(np.abs(values))) if values.size else float("nan"),
+            )
     return out
 
 
@@ -130,7 +147,8 @@ def cell_metrics(cell: pd.DataFrame, cfg, denominators, n_boot: int,
                  arm: str = "return") -> dict:
     """Every metric named in configs/eval.yaml, for one cell."""
     empty = {k: float("nan") for k in
-             ("rmse", "mae", "mase", "directional_accuracy", "da_ci_low", "da_ci_high",
+             ("rmse", "mae", "mase", "scaled_error_mad",
+              "directional_accuracy", "da_ci_low", "da_ci_high",
               "da_se_naive", "da_se_clustered", "da_variance_inflation",
               "da_min_detectable_effect", "da_n_obs", "crps", "picp_80",
               "mean_interval_score_80")}
@@ -141,15 +159,21 @@ def cell_metrics(cell: pd.DataFrame, cfg, denominators, n_boot: int,
     y = cell["y"].to_numpy(dtype=float)
     point = cell[cfg.median_column].to_numpy(dtype=float)
 
-    # MASE: scaled per (fold, ticker), then observation-weighted across them.
-    weights, scaled = [], []
+    # Both scaled errors: per (fold, ticker), then observation-weighted.
+    weights, scaled, scaled_mad = [], [], []
     for (fold, ticker), group in cell.groupby(["fold", "unique_id"], sort=True):
-        denom = denominators.get((int(fold), ticker), float("nan"))
-        if not np.isfinite(denom) or denom == 0:
+        naive_denom, mad_denom = denominators.get(
+            (int(fold), ticker), (float("nan"), float("nan")))
+        if not np.isfinite(naive_denom) or naive_denom == 0:
             continue
+        group_mae = mae(group["y"].to_numpy(), group[cfg.median_column].to_numpy())
         weights.append(len(group))
-        scaled.append(mae(group["y"].to_numpy(), group[cfg.median_column].to_numpy()) / denom)
+        scaled.append(group_mae / naive_denom)
+        scaled_mad.append(group_mae / mad_denom
+                          if np.isfinite(mad_denom) and mad_denom else float("nan"))
     mase_value = (float(np.average(scaled, weights=weights)) if scaled else float("nan"))
+    mad_value = (float(np.average(scaled_mad, weights=weights)) if scaled_mad
+                 else float("nan"))
 
     n_days = int(cell["ds"].nunique())
     if arm == "volatility":
@@ -178,6 +202,7 @@ def cell_metrics(cell: pd.DataFrame, cfg, denominators, n_boot: int,
         "rmse": rmse(y, point),
         "mae": mae(y, point),
         "mase": mase_value,
+        "scaled_error_mad": mad_value,
         "directional_accuracy": da.get("estimate", float("nan")),
         "da_ci_low": da.get("ci_low", float("nan")),
         "da_ci_high": da.get("ci_high", float("nan")),
@@ -405,13 +430,13 @@ def main() -> None:
 
     # Two arms, two targets, two panels. Built only if that arm has forecasts.
     panels = {"return": panel}
-    denominators = {"return": mase_denominators(panel, walk_forward, splits)}
+    denominators = {"return": scale_denominators(panel, walk_forward, splits)}
     if any(arm_of(m) == "volatility" for m in present):
         bars = pd.read_parquet(args.bars,
                                columns=["unique_id", "ds", "open", "high", "low", "close"])
         vol_panel = build_volatility_panel(bars)[["unique_id", "ds", "y"]]
         panels["volatility"] = vol_panel
-        denominators["volatility"] = mase_denominators(vol_panel, walk_forward, splits)
+        denominators["volatility"] = scale_denominators(vol_panel, walk_forward, splits)
 
     print(f"quantile grid: {list(cfg.quantiles)}  point forecast: {cfg.median_column}")
     print(f"bootstrap: {args.n_boot:,} replications, clustered on dates\n")

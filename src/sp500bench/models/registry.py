@@ -40,9 +40,27 @@ class ModelSpec:
 
 REGISTRY: list[ModelSpec] = [
     # Tier 0 - the benchmark that actually matters on daily equity returns.
-    ModelSpec("Naive", "baseline", "statsforecast", "local", True, True,
-              "Random walk. If nothing beats this, that is the finding."),
-    ModelSpec("RandomWalkWithDrift", "baseline", "statsforecast", "local", True, True),
+    #
+    # ZeroReturn is the H1 reference, and the distinction from LastReturn is not
+    # cosmetic. A random walk in *prices* forecasts zero return; predicting
+    # yesterday's return instead is a different model with sqrt(2(1-rho)) times
+    # the RMSE - about 1.45x on this panel - so scoring against it flatters
+    # everything else by roughly 30%. That error was live in this repository
+    # until 2 September 2026; see the note under H1 in the README.
+    ModelSpec("ZeroReturn", "baseline", "sp500bench", "local", True, True,
+              "The random walk on prices: the forecast is always zero. This is the "
+              "H1 reference. Its RMSE is the sample standard deviation of test "
+              "returns by construction, which is the number every other model has "
+              "to beat."),
+    ModelSpec("LastReturn", "baseline", "statsforecast", "local", True, False,
+              "ADDED. statsforecast's Naive: tomorrow's return equals today's. NOT "
+              "the random-walk benchmark - it differences an already-differenced "
+              "series, so its RMSE is sqrt(2(1-rho)) times ZeroReturn's. Kept as an "
+              "informative baseline for how much a spurious lag costs, never as the "
+              "H1 reference."),
+    ModelSpec("RandomWalkWithDrift", "baseline", "statsforecast", "local", True, True,
+              "LastReturn plus the mean per-session change; inherits the same "
+              "differencing penalty and is likewise not the H1 reference."),
 
     # Tier 1 - classical statistical.
     ModelSpec("AutoARIMA", "statistical", "statsforecast", "local", True, True,

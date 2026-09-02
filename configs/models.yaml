@@ -1,5 +1,5 @@
-# Nineteen models across four generations, plus the volatility arm.
-# Nine come from the approved proposal; ten are additions that close the gap
+# Twenty models across four generations, plus the volatility arm.
+# Nine come from the approved proposal; eleven are additions that close the gap
 # to the 2026 literature.
 #
 # This file must agree with src/sp500bench/models/registry.py, which is the
@@ -8,10 +8,22 @@
 # registry already carried. Version 3 adds TTM to Tier 3 and GJR-GARCH to the
 # volatility arm - both pre-registered, both locked before any model was run.
 # Version 4 aligns training.quantiles to the densified evaluation grid.
-version: 4
+# Version 5 splits the Tier 0 baseline in two. What was called Naive was
+# statsforecast's Naive - tomorrow's return equals today's - which is not the
+# random walk on prices and is not what H1 is written against. ZeroReturn is the
+# correct benchmark and is now the H1 reference; the old model is kept, renamed
+# LastReturn, as an informative baseline.
+version: 5
 
-tier_0_baselines:              # proposal
-  - {name: Naive,               lib: statsforecast, cost: negligible}
+tier_0_baselines:
+  # The H1 reference. Random walk on prices => zero forecast return. Its RMSE is
+  # the sample standard deviation of test returns by construction.
+  - {name: ZeroReturn,          lib: sp500bench,    cost: negligible}
+  # ADDED. statsforecast's Naive, renamed for what it is: y[t+1] = y[t] on a
+  # return series. It differences an already-differenced series, so its RMSE is
+  # sqrt(2(1-rho)) ~ 1.45x ZeroReturn's on this panel. Informative, not the
+  # reference - scoring against it inflates every other model by ~30%.
+  - {name: LastReturn,          lib: statsforecast, cost: negligible}
   - {name: RandomWalkWithDrift, lib: statsforecast, cost: negligible}
 
 tier_1_statistical:            # proposal

@@ -41,8 +41,9 @@ Removes the need for the `PYTHONPATH=src` prefix.
 ```
 configs/          frozen experiment specification
 src/sp500bench/   the package — do not flatten this tree, imports depend on it
-tests/            92 tests: leakage (28), numerical (17),
-                  MCS/HAR/robust-SE (21), backtest costs (18), config gate (8)
+tests/            97 tests: leakage (28), numerical (17),
+                  MCS/HAR/robust-SE (21), backtest costs (18), config gate (8),
+                  H1 benchmark identity (5)
 scripts/          pipeline entry points — build_dataset, build_features,
                   run_experiment and evaluate exist; run_experiment executes
                   Tiers 0 and 1, so `make all` cannot run end to end yet
