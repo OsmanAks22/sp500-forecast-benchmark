@@ -103,6 +103,24 @@ class ExperimentConfig:
     def embargo(self) -> int:
         return int(self.evaluation["cross_validation"]["embargo"])
 
+    def horizon_for(self, arm: str = "return") -> int:
+        """Purge width for one arm, in sessions.
+
+        The two arms forecast different targets and so consume different amounts
+        of future data per label. The return arm's label at ``t`` is the 1-day
+        forward log return and consumes one session; the volatility arm's is the
+        Yang-Zhang estimate over ``t+1 .. t+21`` and consumes twenty-one.
+
+        Purging both at the return arm's horizon would leave fifteen sessions of
+        test data inside every volatility training fold - and
+        :func:`~sp500bench.evaluation.splits.assert_no_overlap` would not catch
+        it, because it would be measuring the gap it was told to measure. A guard
+        given the wrong parameter is worse than no guard; it reads as assurance.
+        """
+        if arm == "volatility":
+            return int(self.evaluation["volatility_arm"]["horizon"])
+        return self.horizon
+
     @property
     def test_windows(self) -> list[tuple[str, str]]:
         return [tuple(w) for w in self.evaluation["cross_validation"]["test_windows"]]

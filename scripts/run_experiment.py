@@ -193,6 +193,7 @@ def run_model(
     out_root: Path,
     timings_path: Path,
     warmed: set[str],
+    horizon: int = 1,
 ) -> None:
     executor = EXECUTORS[spec.name]
     model_dir = out_root / spec.name
@@ -234,7 +235,7 @@ def run_model(
         forecasts = executor(
             panel=panel, train=train,
             test_start=split.test_start, test_end=split.test_end,
-            quantiles=quantiles, target_col="y",
+            quantiles=quantiles, target_col="y", horizon=horizon,
         )
         elapsed = time.perf_counter() - t0
 
@@ -336,24 +337,33 @@ def main() -> None:
               f"{volatility_panel['ds'].max().date()}]")
 
     data_cfg = load_data_config()
-    walk_forward = PurgedWalkForward(
-        test_windows=cfg.test_windows,
-        horizon=cfg.horizon,
-        embargo=cfg.embargo,
-        train_start=data_cfg["splits"]["train"]["start"],
-    )
+    # One scheme per arm. The folds, the embargo and the grid are shared; the
+    # purge width is not, because the two arms' labels consume different amounts
+    # of future data. See ExperimentConfig.horizon_for.
+    walk_forwards = {
+        arm: PurgedWalkForward(
+            test_windows=cfg.test_windows,
+            horizon=cfg.horizon_for(arm),
+            embargo=cfg.embargo,
+            train_start=data_cfg["splits"]["train"]["start"],
+        )
+        for arm in ("return", "volatility")
+    }
+    walk_forward = walk_forwards["return"]
     print(f"\npanel: {len(panel):,} rows, {panel['unique_id'].nunique()} tickers, "
           f"{panel['ds'].nunique():,} sessions "
           f"[{panel['ds'].min().date()} .. {panel['ds'].max().date()}]")
-    print(f"folds: {len(cfg.test_windows)}, purge {cfg.horizon} + embargo "
-          f"{cfg.embargo} = {walk_forward.gap} sessions excised per fold")
+    for arm, wf in walk_forwards.items():
+        print(f"folds ({arm:<10}): {len(cfg.test_windows)}, purge "
+              f"{wf.horizon} + embargo {wf.embargo} = {wf.gap} sessions excised per fold")
 
     out_root, timings_path = Path(args.out), Path(args.timings)
     warmed: set[str] = set()
     for spec in runnable:
-        target_panel = volatility_panel if is_volatility_model(spec) else panel
-        run_model(spec, target_panel, walk_forward, cfg.quantiles, out_root,
-                  timings_path, warmed)
+        arm = "volatility" if is_volatility_model(spec) else "return"
+        target_panel = volatility_panel if arm == "volatility" else panel
+        run_model(spec, target_panel, walk_forwards[arm], cfg.quantiles, out_root,
+                  timings_path, warmed, horizon=cfg.horizon_for(arm))
 
     print("\nDone.")
 

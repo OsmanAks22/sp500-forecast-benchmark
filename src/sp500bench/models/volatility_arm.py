@@ -16,29 +16,29 @@ arrives between the close and the next open. Parkinson and Garman-Klass discard
 it and understate equity volatility as a result; Rogers-Satchell handles drift
 but not gaps.
 
-Forecast timing, and a caveat worth stating plainly
-----------------------------------------------------
-The target at session ``t`` is the Yang-Zhang estimate over the 21 sessions
-ending at ``t``, and the HAR features at ``t`` are lagged one session, so this is
-a one-step-ahead forecast of a trailing window - the convention already
-implemented and tested in ``volatility.py`` and ``tests/test_mcs_volatility.py``.
-It is leak-free under the frozen purge of one session: a label at ``t`` looks
-*backward* 21 sessions and consumes nothing after ``t``.
+Forecast timing: the target is forward
+---------------------------------------
+The target at session ``t`` is the Yang-Zhang estimate over sessions
+``t+1 .. t+21``. The forecast origin is ``t``, and the HAR features at ``t`` use
+data through ``t`` inclusive, so the whole of the target lies strictly in the
+future of everything the model sees.
 
-The caveat is that a trailing 21-session window overlaps its own predecessor in
-20 of 21 sessions. Only one session of the target is genuinely unknown at
-forecast time, so every model on this arm will post a very low error and the
-differences between them will be small in absolute terms. Read the arm as a
-ranking, not as evidence that volatility is easy to forecast.
+This replaces a trailing target - Yang-Zhang over ``t-20 .. t`` - which was
+wrong in a way that made the arm meaningless. A trailing window overlaps its own
+predecessor in 20 of 21 sessions, so ``rv_d = y(t-1)`` shared 20/21 of its
+sessions with ``y(t)`` and the HAR cascade was regressing on lags of the target
+itself. That is smoothing, not forecasting. It also structurally penalised any
+model that does not use the target's own lag: GJR-GARCH scored 4x worse than
+Log-HAR under it despite forecasts correlating 0.86 with the target and sitting
+within 3% of its mean level. H5 asks whether models separate on volatility, and
+under a trailing target the answer was decided by the target's construction
+rather than by the models.
 
-The alternative - a *forward* 21-session window, which is what "forecasting
-volatility" usually means - is not available under the frozen configuration. A
-forward label at ``t`` would consume data through ``t+21``, so it would need
-``cross_validation.horizon: 21`` in configs/eval.yaml to be purged correctly;
-under the frozen ``horizon: 1`` it would leak fifteen sessions of test data into
-every training fold, and ``assert_no_overlap`` would not catch it because it
-would be checking the wrong horizon. That is a config change, and the config is
-frozen.
+The purge follows the target. A forward label consumes data through ``t+21``, so
+this arm is purged at ``horizon: 21`` from ``configs/eval.yaml``'s
+``volatility_arm`` block while the return arm keeps ``horizon: 1``.
+``assert_no_overlap`` receives the arm's own horizon; given the return arm's, it
+would wave through fifteen sessions of leakage and report a clean fold.
 
 Predictive quantiles
 --------------------
@@ -73,10 +73,22 @@ HAR_COLUMNS = ["rv_d", "rv_w", "rv_m"]
 def build_volatility_panel(bars: pd.DataFrame) -> pd.DataFrame:
     """Yang-Zhang target plus the HAR cascade, per ticker.
 
-    Returns ``[unique_id, ds, y, ret, rv_d, rv_w, rv_m]`` where ``y`` is the
-    21-session Yang-Zhang estimate at that session and the ``rv_*`` columns are
-    the daily, weekly and monthly components of the cascade, each already lagged
-    one session by :func:`~sp500bench.models.volatility.har_features`.
+    Returns ``[unique_id, ds, y, ret, rv_d, rv_w, rv_m]``.
+
+    ``y`` at session ``t`` is the Yang-Zhang estimate over ``t+1 .. t+21`` - the
+    *forward* window, which is what forecasting volatility means. Since
+    ``yang_zhang`` returns a trailing estimate at each session, the forward label
+    is that series shifted back 21 sessions: ``rv[t+21]`` is exactly Yang-Zhang
+    over ``t+1 .. t+21``. The last 21 sessions of each ticker have no label and
+    drop out.
+
+    The ``rv_*`` columns are the daily, weekly and monthly components of the HAR
+    cascade computed **through ``t`` inclusive**, not shifted back one session.
+    :func:`~sp500bench.models.volatility.har_features` shifts by one because it
+    was written for a same-session target; here the origin is ``t`` and ``rv[t]``
+    is observed at the close of ``t``, so shifting would discard a session of
+    information for no gain in safety. The frozen module is left untouched and
+    the unshifted cascade is built here.
 
     Every series is built per ticker and never across the panel, so no rolling
     window can straddle two names.
@@ -86,9 +98,15 @@ def build_volatility_panel(bars: pd.DataFrame) -> pd.DataFrame:
         bar = group.set_index("ds").sort_index()
         rv = yang_zhang(bar["open"], bar["high"], bar["low"], bar["close"],
                         window=RV_WINDOW)
-        block = har_features(rv)
-        block["y"] = rv
-        block["ret"] = np.log(bar["close"]).diff()
+        block = pd.DataFrame({
+            # Cascade through t inclusive: everything observed at the close of t.
+            "rv_d": rv,
+            "rv_w": rv.rolling(5, min_periods=5).mean(),
+            "rv_m": rv.rolling(22, min_periods=22).mean(),
+            # Forward label: Yang-Zhang over t+1 .. t+21.
+            "y": rv.shift(-RV_WINDOW),
+            "ret": np.log(bar["close"]).diff(),
+        })
         block.insert(0, "unique_id", ticker)
         blocks.append(block.reset_index())
     out = pd.concat(blocks, ignore_index=True)
@@ -100,7 +118,13 @@ def _har_fold(panel, train, test_start, test_end, quantiles, log_target, **_):
     """Shared body for HAR-RV and Log-HAR: fit per ticker on the purged window."""
     levels = list(quantiles)
     columns = [quantile_column(q) for q in levels]
+    # The forward label runs 21 sessions past its origin, so the last 21
+    # sessions of the panel have no outcome to be scored against. Forecasts are
+    # not emitted for them - the return arm drops its unlabelled tail the same
+    # way, and an unscoreable forecast in the file is just a row that will later
+    # look like a join failure.
     test = panel[(panel["ds"] >= test_start) & (panel["ds"] <= test_end)]
+    test = test.dropna(subset=["y"])
 
     out = []
     for ticker, test_group in test.groupby("unique_id", sort=True):
@@ -179,8 +203,41 @@ def _gjr_variance_path(returns: np.ndarray, omega: float, alpha: float,
     return sigma2
 
 
-def gjr_garch_forecast_fold(panel, train, test_start, test_end, quantiles, **_):
-    """GJR-GARCH(1,1) with skew-t innovations, mapped onto the RV target.
+def _multistep_mean_variance(one_step: np.ndarray, omega: float, kappa: float,
+                             horizon: int) -> np.ndarray:
+    """Average conditional variance over the next ``horizon`` sessions.
+
+    At origin ``t`` the model's one-step forecast is ``v = sigma2[t+1]``. Beyond
+    that the GJR forecast follows::
+
+        E_t[sigma2_{t+h}] = omega + kappa * E_t[sigma2_{t+h-1}]
+
+    with ``kappa = alpha + gamma/2 + beta`` the persistence. The ``gamma/2``
+    assumes the innovation is negative half the time; with skew-t innovations
+    that is approximate, and the approximation is standard.
+
+    The recursion is iterated directly rather than summed in closed form. The
+    closed form divides by ``1 - kappa``, which is fine for a mean-reverting fit
+    and useless for a near-integrated one: three tickers here (BAC, GE, WFC) fit
+    with ``kappa >= 1`` in some folds - unsurprising for financials whose
+    training window contains 2008 - and the closed form returned NaN for every
+    session of those ticker-folds, silently dropping 3,092 forecasts and leaving
+    GJR-GARCH scored on a smaller sample than the models it was being ranked
+    against. Iterating costs 21 vectorised steps and is exact for any ``kappa``,
+    including ``kappa >= 1``, where the variance forecast legitimately grows with
+    the horizon instead of reverting.
+    """
+    total = np.zeros_like(one_step)
+    current = one_step.copy()
+    for _ in range(horizon):
+        total += current
+        current = omega + kappa * current
+    return total / horizon
+
+
+def gjr_garch_forecast_fold(panel, train, test_start, test_end, quantiles,
+                            horizon: int = RV_WINDOW, **_):
+    """GJR-GARCH(1,1) with skew-t innovations, forecasting forward realised vol.
 
     Fitted once per fold per ticker on the purged training window, by maximum
     likelihood through ``arch``::
@@ -190,22 +247,18 @@ def gjr_garch_forecast_fold(panel, train, test_start, test_end, quantiles, **_):
     Returns are scaled by 100 before fitting, which is what ``arch`` expects for
     numerical stability, and scaled back afterwards.
 
-    Two mappings are needed to score a daily-variance model against a 21-session
-    range-based proxy, and both are stated rather than buried:
+    The forecast at origin ``t`` is the root mean of the model's conditional
+    variance forecasts for ``t+1 .. t+21``, in closed form via
+    :func:`_multistep_mean_variance`. Every term is an expectation formed at
+    ``t``, so nothing after ``t`` enters.
 
-    *Aggregation.* The model's prediction of the 21-session realised volatility
-    at ``t`` is the root mean of its own conditional variance path over the 21
-    sessions ending at ``t``. Every term in that mean is a one-step-ahead
-    conditional variance, so the whole quantity is a function of returns through
-    ``t-1``.
-
-    *Calibration.* GJR-GARCH is fitted on close-to-close returns; Yang-Zhang also
-    counts the overnight gap and uses the daily range, so the two sit on
-    systematically different scales. A single multiplicative factor - the ratio
-    of mean target to mean prediction over the training window - puts them on the
-    same scale. It is one number per ticker per fold, estimated on training data
-    alone. Without it the arm would be measuring the gap between two volatility
-    proxies rather than the models' forecasting skill.
+    One mapping remains and is stated rather than buried. GJR-GARCH is fitted on
+    close-to-close returns; Yang-Zhang also counts the overnight gap and uses the
+    daily range, so the two sit on systematically different scales. A single
+    multiplicative factor - the ratio of mean target to mean prediction over the
+    training window - puts them on the same scale. It is one number per ticker
+    per fold, estimated on training data alone. Without it the arm would measure
+    the gap between two volatility proxies rather than forecasting skill.
 
     Bands are log-normal, from the model's own training residuals on the log
     scale, which keeps the predictive distribution positive and right-skewed as
@@ -233,17 +286,26 @@ def gjr_garch_forecast_fold(panel, train, test_start, test_end, quantiles, **_):
                             dist="skewt", mean="Constant").fit(disp="off",
                                                                show_warning=False)
         params = fitted.params
-        sigma2 = _gjr_variance_path(
-            returns * 100.0,
-            omega=float(params["omega"]), alpha=float(params["alpha[1]"]),
-            gamma=float(params["gamma[1]"]), beta=float(params["beta[1]"]),
-            mu=float(params["mu"]),
-        ) / 10_000.0
+        omega = float(params["omega"])
+        alpha = float(params["alpha[1]"])
+        gamma = float(params["gamma[1]"])
+        beta = float(params["beta[1]"])
+        sigma2 = _gjr_variance_path(returns * 100.0, omega=omega, alpha=alpha,
+                                    gamma=gamma, beta=beta, mu=float(params["mu"]))
 
-        # 21-session aggregation: root mean of the conditional variance path.
-        predicted = np.sqrt(pd.Series(sigma2).rolling(RV_WINDOW,
-                                                      min_periods=RV_WINDOW).mean()
-                            ).to_numpy()
+        # sigma2[t] is the variance for session t given t-1, so the one-step
+        # forecast formed at origin t is sigma2[t+1]. The recursion is extended
+        # one session past the end of the data so the final origin - the last
+        # session of the test window - has a forecast too; without it every
+        # ticker silently lost its last session in every fold.
+        resid_last = returns[-1] * 100.0 - float(params["mu"])
+        shock = (alpha + (gamma if resid_last < 0 else 0.0)) * resid_last ** 2
+        one_step = np.empty_like(sigma2)
+        one_step[:-1] = sigma2[1:]
+        one_step[-1] = omega + shock + beta * sigma2[-1]
+        mean_var = _multistep_mean_variance(one_step, omega,
+                                            alpha + 0.5 * gamma + beta, horizon)
+        predicted = np.sqrt(np.clip(mean_var, 0.0, None) / 10_000.0)
 
         target = series["y"].to_numpy(dtype=float)
         calibratable = in_train & np.isfinite(target) & np.isfinite(predicted) & (predicted > 0)
@@ -259,7 +321,8 @@ def gjr_garch_forecast_fold(panel, train, test_start, test_end, quantiles, **_):
         centre_shift = float(np.mean(log_resid))
 
         in_test = ((series["ds"] >= test_start) & (series["ds"] <= test_end)).to_numpy()
-        keep = in_test & np.isfinite(predicted) & (predicted > 0)
+        # Same rule as the HAR path: no forecast where there is no label.
+        keep = in_test & np.isfinite(predicted) & (predicted > 0) & np.isfinite(target)
         if not keep.any():
             continue
 

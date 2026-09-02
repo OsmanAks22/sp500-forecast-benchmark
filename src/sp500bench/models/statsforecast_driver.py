@@ -124,8 +124,14 @@ def statsforecast_fold(
     id_col: str = "unique_id",
     time_col: str = "ds",
     target_col: str = "y",
+    **_,
 ) -> pd.DataFrame:
     """One fold of a statsforecast model: point forecasts plus residual bands.
+
+    Extra keyword arguments are accepted and ignored so the runner can pass
+    arm-level metadata - the purge horizon, for instance - uniformly to every
+    executor. These models take their forecast origin from the fold, not from a
+    horizon argument: they are always one-step-ahead.
 
     ``panel`` is the full history; ``train`` is the fold's training frame, already
     purged and embargoed by

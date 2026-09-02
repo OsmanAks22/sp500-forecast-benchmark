@@ -336,9 +336,10 @@ def print_volatility_arm(table: pd.DataFrame, reference: str = "Log-HAR") -> Non
     print("\nRatios are model / reference; below 1.00 beats the reference.")
     print("Directional accuracy is omitted: realised volatility is positive, so the")
     print("sign always matches and the statistic is identically 1.")
-    print("The target is a TRAILING 21-session window, so 20 of its 21 sessions are")
-    print("already observed at forecast time. Errors are correspondingly small -")
-    print("read the arm as a ranking, not as evidence that volatility is easy.")
+    print("The target is the FORWARD window: Yang-Zhang over sessions t+1 .. t+21,")
+    print("forecast from information through t. This arm is purged at horizon 21,")
+    print("not the return arm's 1, so its training windows end 26 sessions before")
+    print("each test window rather than 6.")
 
 
 def print_comparison(table: pd.DataFrame) -> None:
@@ -418,10 +419,20 @@ def main() -> None:
              .rename(columns={"target": "y"}).sort_values(["unique_id", "ds"]))
     regimes = pd.read_parquet(args.regimes)[["vol_regime", "direction_regime"]]
 
-    walk_forward = PurgedWalkForward(
-        test_windows=cfg.test_windows, horizon=cfg.horizon, embargo=cfg.embargo,
-        train_start=load_data_config()["splits"]["train"]["start"])
-    splits = walk_forward.splits(pd.DatetimeIndex(panel["ds"].unique()).sort_values())
+    # One scheme per arm: the volatility arm's label consumes 21 sessions of
+    # future data against the return arm's 1, so its training windows end
+    # earlier and its MASE denominators come from a different span.
+    calendar = pd.DatetimeIndex(panel["ds"].unique()).sort_values()
+    walk_forwards, splits_by_arm = {}, {}
+    for arm in ("return", "volatility"):
+        wf = PurgedWalkForward(
+            test_windows=cfg.test_windows, horizon=cfg.horizon_for(arm),
+            embargo=cfg.embargo,
+            train_start=load_data_config()["splits"]["train"]["start"])
+        walk_forwards[arm] = wf
+        splits_by_arm[arm] = wf.splits(calendar)
+    walk_forward = walk_forwards["return"]
+    splits = splits_by_arm["return"]
     folds = [s.fold for s in splits]
 
     forecast_root = Path(args.forecasts)
@@ -435,8 +446,10 @@ def main() -> None:
         bars = pd.read_parquet(args.bars,
                                columns=["unique_id", "ds", "open", "high", "low", "close"])
         vol_panel = build_volatility_panel(bars)[["unique_id", "ds", "y"]]
-        panels["volatility"] = vol_panel
-        denominators["volatility"] = scale_denominators(vol_panel, walk_forward, splits)
+        panels["volatility"] = vol_panel.dropna(subset=["y"])
+        denominators["volatility"] = scale_denominators(
+            panels["volatility"], walk_forwards["volatility"],
+            splits_by_arm["volatility"])
 
     print(f"quantile grid: {list(cfg.quantiles)}  point forecast: {cfg.median_column}")
     print(f"bootstrap: {args.n_boot:,} replications, clustered on dates\n")

@@ -222,6 +222,30 @@ trailing 252-session peak.
 separate clearly and at least one beats Log-HAR - but the margin is small.
 Brini (2026) finds only TTM beats Log-HAR at every horizon, by roughly 1.3-1.8%.
 
+*Target defined 2 September 2026, after the volatility arm was first run and
+before any hypothesis test.* **"21-day realised volatility" means the Yang-Zhang
+estimate over sessions `t+1` to `t+21`, forecast from information through `t`.**
+The forward window, not a trailing one.
+
+The distinction decides the hypothesis. A trailing 21-session window overlaps its
+own predecessor in 20 of 21 sessions, so `rv_d = y(t-1)` shares 20/21 of its
+sessions with `y(t)` and the HAR cascade regresses on lags of the target itself.
+That is smoothing, not forecasting. Measured that way the arm reported GJR-GARCH
+at 4.2x Log-HAR's RMSE — not because it forecasts volatility badly (its
+predictions correlate 0.86 with the target and sit within 3% of its mean level)
+but because it does not use the target's own lag, and under a trailing target
+nothing else matters. H5 asks whether models separate on volatility; a trailing
+target answers with the target's construction instead. On the forward target the
+same three models sit at 1.00, 1.01 and 1.03.
+
+The purge follows the target. A forward label consumes data 21 sessions ahead,
+so this arm is purged at `horizon: 21` — recorded in `configs/eval.yaml` v3 as
+`volatility_arm.horizon` — against the return arm's `horizon: 1`. Its training
+windows therefore end 26 sessions before each test window rather than 6.
+`assert_no_overlap` receives the arm's own horizon; given the return arm's, it
+would wave through 15 sessions of leakage and report a clean fold. The folds,
+the embargo and the quantile grid are shared; only the purge width differs.
+
 **Prediction registered in advance:** directional accuracy falls in the 50-53%
 band. Anything above ~53% is treated as evidence of a defect in this pipeline
 until proven otherwise, not as a finding.

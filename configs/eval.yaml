@@ -1,4 +1,4 @@
-version: 2
+version: 3
 
 cross_validation:
   scheme: purged_expanding_walk_forward
@@ -18,6 +18,16 @@ cross_validation:
 # forecast, so H1 and the backtest are untouched by this.
 quantiles: [0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]
 point_forecast_from: median
+
+# The volatility arm forecasts a different target and therefore needs a
+# different purge. Its label at session t is the Yang-Zhang estimate over
+# sessions t+1 .. t+21, so it consumes data 21 sessions forward; the return
+# arm's label consumes one. Purging the volatility arm at horizon 1 would leave
+# 15 sessions of test data inside every training fold, and assert_no_overlap
+# would pass, because it would be checking the wrong horizon. The folds, the
+# embargo and the quantile grid are shared; only the purge width differs.
+volatility_arm:
+  horizon: 21
 
 metrics:
   point:         [rmse, mae, mase, directional_accuracy]
