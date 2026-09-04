@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Bash",
+      "Read",
+      "Edit",
+      "Write",
+      "Glob",
+      "Grep",
+      "NotebookEdit",
+      "WebFetch",
+      "WebSearch"
+    ],
+    "deny": [
+      "Edit(README.md)",
+      "Write(README.md)",
+      "NotebookEdit(README.md)",
+      "Edit(configs/**)",
+      "Write(configs/**)",
+      "NotebookEdit(configs/**)"
+    ]
+  }
+}
