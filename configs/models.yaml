@@ -13,7 +13,11 @@
 # random walk on prices and is not what H1 is written against. ZeroReturn is the
 # correct benchmark and is now the H1 reference; the old model is kept, renamed
 # LastReturn, as an informative baseline.
-version: 5
+# Version 6 marks Moirai-2.0 excluded. The roster is still twenty specs; nineteen
+# are runnable. The entry is kept rather than deleted so the pre-registration
+# record shows a model that was specified, attempted and excluded for a stated
+# environmental reason, rather than one that simply is not there.
+version: 6
 
 tier_0_baselines:
   # The H1 reference. Random walk on prices => zero forecast return. Its RMSE is
@@ -68,12 +72,25 @@ tier_3_foundation:
            TimesFM3Forecaster, not TimesFm - the latter does not exist in the
            installed release. Confirmed on Kaggle 2 September 2026; the module
            namespace also carries TimesFM3Torch and TimesFM_2p5_200M_torch."
+  # EXCLUDED 5 September 2026, after the Kaggle smoke test and before any result.
+  # The spec stays here deliberately: it was pre-registered, it was attempted,
+  # and it was excluded for a documented environmental reason. A model that
+  # vanishes between the protocol and the results is indistinguishable, from the
+  # outside, from one dropped because its numbers were inconvenient.
   - name: Moirai-2.0
     lib: uni2ts
     checkpoint: Salesforce/moirai-2.0-R-small
     mode: zero_shot
     pretrain_cutoff: undocumented
-    note: "Decoder-only with multi-token prediction; top GIFT-Eval ranking."
+    status: excluded
+    excluded_reason: "uni2ts pins numpy~=1.26.0; the Kaggle image ships 2.0.2"
+    note: "Decoder-only with multi-token prediction; top GIFT-Eval ranking.
+           NOT RUNNABLE. Resolved in its own pip transaction, uni2ts 2.0.0,
+           1.2.0 and 1.1.1 all depend on numpy~=1.26.0 against the image's numpy
+           2.0.2, so no available version installs. Downgrading numpy breaks
+           pandas' C extension and every other model with it, so the pins were
+           not widened. Reported in Limitations as a reproducibility finding
+           about the TSFM ecosystem."
   - name: Kronos-small
     lib: kronos
     checkpoint: NeoQuasar/Kronos-small

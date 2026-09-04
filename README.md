@@ -556,7 +556,7 @@ src/sp500bench/
                   Tier 1 statistical share one statsforecast driver
   backtest/       cost-aware simulation
 tests/            leakage (28) + numerical (17) + MCS/HAR/robust-SE (21)
-                  + backtest cost accounting (18) + config gate (8)
+                  + backtest cost accounting (18) + config gate (10)
                   + H1 benchmark identity (5)
 scripts/          pipeline entry points — build_dataset, build_features,
                   run_experiment and evaluate are written; run_experiment

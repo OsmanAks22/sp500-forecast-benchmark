@@ -18,8 +18,11 @@ from __future__ import annotations
 import pytest
 import yaml
 
+import yaml as _yaml
+
 from sp500bench.config import (ConfigError, DEFAULT_EVAL_CONFIG, DEFAULT_MODELS_CONFIG,
                                load_configs, quantile_column, quantile_columns)
+from sp500bench.models.registry import REGISTRY, excluded, runnable
 
 GRID = [0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]
 
@@ -137,3 +140,52 @@ def test_quantile_column_names_are_stable():
         "q0.01", "q0.05", "q0.1", "q0.25", "q0.5", "q0.75", "q0.9", "q0.95", "q0.99"
     ]
     assert len(set(quantile_columns(GRID))) == len(GRID), "levels must not collide"
+
+
+# ---------------------------------------------------------------------------
+# An excluded model stays in the roster and stays out of the run
+# ---------------------------------------------------------------------------
+
+def test_excluded_specs_stay_in_the_roster_and_carry_a_reason():
+    """A model that cannot run is recorded, not deleted.
+
+    Moirai-2.0 was pre-registered and then found unrunnable: every available
+    uni2ts version pins numpy~=1.26.0 against the image's 2.0.2. Deleting the
+    spec would leave the write-up describing nineteen models with no trace that
+    a twentieth was specified in advance - which from the outside is
+    indistinguishable from a model dropped because its numbers were
+    inconvenient. So the spec stays, flagged, with the reason attached.
+    """
+    assert len(REGISTRY) == 20, "the roster is twenty specs"
+    gone = [m for m in REGISTRY if excluded(m)]
+    assert gone, "at least one spec is excluded; see the note in registry.py"
+    for spec in gone:
+        assert spec.params.get("excluded_reason"), (
+            f"{spec.name} is excluded without a stated reason"
+        )
+    assert len(runnable()) == len(REGISTRY) - len(gone)
+    assert all(not excluded(m) for m in runnable())
+
+
+def test_the_two_config_halves_agree_on_which_specs_are_excluded():
+    """registry.py and models.yaml must not disagree about what can run."""
+    yaml_specs = {}
+    document = _yaml.safe_load(open(DEFAULT_MODELS_CONFIG))
+    for section, entries in document.items():
+        if section in ("version", "training"):
+            continue
+        for entry in entries:
+            yaml_specs[entry["name"]] = entry
+
+    assert len(yaml_specs) == len(REGISTRY), "both halves list the same specs"
+    for spec in REGISTRY:
+        entry = yaml_specs[spec.name]
+        in_yaml = entry.get("status") == "excluded"
+        assert in_yaml == excluded(spec), (
+            f"{spec.name}: models.yaml says excluded={in_yaml}, "
+            f"registry says {excluded(spec)}"
+        )
+        if in_yaml:
+            assert entry.get("excluded_reason"), (
+                f"{spec.name} excluded in models.yaml without a reason"
+            )

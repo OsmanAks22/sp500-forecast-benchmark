@@ -61,7 +61,8 @@ from sp500bench.models.volatility_arm import (build_volatility_panel,  # noqa: E
                                               gjr_garch_forecast_fold,
                                               har_forecast_fold,
                                               log_har_forecast_fold)
-from sp500bench.models.registry import REGISTRY, ModelSpec  # noqa: E402
+from sp500bench.models.registry import (REGISTRY, ModelSpec,  # noqa: E402
+                                        excluded)
 from sp500bench.models.volatility_arm import RV_WINDOW  # noqa: E402
 
 TIERS = ["baseline", "statistical", "linear", "recurrent", "transformer", "foundation"]
@@ -158,7 +159,12 @@ def partition(roster: list[ModelSpec]) -> tuple[list[ModelSpec], list[tuple[Mode
     runnable, skipped = [], []
     for spec in roster:
         available, how = library_available(spec.library)
-        if not available:
+        if excluded(spec):
+            # Pre-registered, attempted, and excluded for a stated reason. It is
+            # reported every run rather than dropped from the roster, so the
+            # exclusion stays visible instead of becoming a silent absence.
+            skipped.append((spec, f"EXCLUDED - {spec.params['excluded_reason']}"))
+        elif not available:
             skipped.append((spec, f"library {spec.library!r} not installed - {how}"))
         elif spec.name not in EXECUTORS:
             skipped.append((spec, "no executor implemented yet"))

@@ -99,10 +99,25 @@ REGISTRY: list[ModelSpec] = [
               {"checkpoint": "google/timesfm-2.5-200m-pytorch",
                "entry_point": "timesfm.TimesFM3Forecaster",
                "pretrain_cutoff": "undocumented"}),
+    # EXCLUDED 5 September 2026, after the Kaggle smoke test and before any
+    # result. The spec is kept rather than deleted: it was pre-registered, it
+    # was attempted, and it was excluded for a documented environmental reason.
+    # A model that vanishes between the protocol and the results is
+    # indistinguishable, from the outside, from one dropped because its numbers
+    # were inconvenient.
     ModelSpec("Moirai-2.0", "foundation", "uni2ts", "zero_shot", True, False,
-              "ADDED. Decoder-only with multi-token prediction; top GIFT-Eval ranking.",
+              "ADDED. Decoder-only with multi-token prediction; top GIFT-Eval "
+              "ranking. NOT RUNNABLE. Resolved in its own pip transaction, "
+              "uni2ts 2.0.0, 1.2.0 and 1.1.1 all depend on numpy~=1.26.0 against "
+              "the Kaggle image's numpy 2.0.2, so no available version installs. "
+              "Downgrading numpy breaks pandas' C extension and every other model "
+              "with it, so the pins were not widened. Reported in Limitations as "
+              "a reproducibility finding about the TSFM ecosystem.",
               {"checkpoint": "Salesforce/moirai-2.0-R-small",
-               "pretrain_cutoff": "undocumented"}),
+               "pretrain_cutoff": "undocumented",
+               "status": "excluded",
+               "excluded_reason": "uni2ts pins numpy~=1.26.0; the Kaggle image "
+                                  "ships 2.0.2"}),
     ModelSpec("Kronos-small", "foundation", "kronos", "zero_shot", True, False,
               "ADDED. Finance-specific TSFM (AAAI 2026), native OHLCV tokenisation. "
               "Autoregressive sampling - derive returns from predicted close; "
@@ -149,6 +164,21 @@ CLEAN_SLICE_VALID_FOR = {"Kronos-small"}
 BY_NAME = {m.name: m for m in REGISTRY}
 
 
+def excluded(spec: ModelSpec) -> bool:
+    """Whether a model is pre-registered but cannot be run.
+
+    An excluded spec stays in the roster so the record shows it was specified
+    and attempted; it is skipped at run time and carries ``excluded_reason``.
+    The roster is twenty specs; ``runnable()`` is the nineteen that execute.
+    """
+    return spec.params.get("status") == "excluded"
+
+
+def runnable() -> list[ModelSpec]:
+    """The roster minus anything excluded."""
+    return [m for m in REGISTRY if not excluded(m)]
+
+
 def contaminated(spec: ModelSpec) -> bool:
     """Whether a model's pre-training corpus may overlap the test period.
 
@@ -165,12 +195,14 @@ def summary() -> str:
     rows.append("-" * 62)
     for m in REGISTRY:
         origin = "proposal" if m.in_proposal else "ADDED"
-        rows.append(f"{m.name:<22}{m.tier:<14}{m.scope:<11}{origin}")
+        mark = "  EXCLUDED" if excluded(m) else ""
+        rows.append(f"{m.name:<22}{m.tier:<14}{m.scope:<11}{origin}{mark}")
     return "\n".join(rows)
 
 
 if __name__ == "__main__":
     print(summary())
-    print(f"\n{len(REGISTRY)} models | "
+    print(f"\n{len(REGISTRY)} specs | "
           f"{sum(m.in_proposal for m in REGISTRY)} from proposal | "
-          f"{sum(not m.in_proposal for m in REGISTRY)} added")
+          f"{sum(not m.in_proposal for m in REGISTRY)} added | "
+          f"{len(runnable())} runnable, {len(REGISTRY) - len(runnable())} excluded")
