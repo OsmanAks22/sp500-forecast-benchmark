@@ -176,6 +176,24 @@ FOUNDATION_MODELS = ["Chronos-2", "TimesFM-2.5", "TTM", "Kronos-small"]
 # against the loaded checkpoint before use.
 TIMESFM_NATIVE_GRID = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
 
+# Must be passed explicitly. `_ModelConfig.checkpoint_path` defaults to
+# "google/timesfm-3.0-pytorch", so constructing TimesFM3Forecaster() with no
+# arguments silently loads 3.0 - a different model from the pre-registered one,
+# with an output shape identical enough that nothing downstream would notice.
+TIMESFM_CHECKPOINT = "google/timesfm-2.5-200m-pytorch"
+
+# Tried in this order. `predict_batch` first because it is the batched entry
+# point and the others are wrappers around it or older spellings; `forecast`
+# is the TimesFM_2p5 base-class name, which is NOT on the forecaster - calling
+# it was what failed on Kaggle - but is kept in the order in case a future
+# release moves the surface back.
+TIMESFM_METHOD_PREFERENCE = ("predict_batch", "predict", "forecast",
+                             "generate", "__call__")
+
+# Names worth dumping the signature of when discovery fails.
+INFERENCE_NAME_HINTS = ("forecast", "predict", "call", "compile", "decode",
+                        "generate", "infer", "run")
+
 DEFAULT_CONTEXT = 512          # Kronos' documented context_limit; TTM's fixed
                                # context_length. Shared so the four models see
                                # the same history and the comparison is on the
@@ -447,12 +465,32 @@ class TimesFMAdapter(Adapter):
                 f"timesfm.{entry} is gone. Namespace: "
                 f"{sorted(n for n in dir(timesfm) if not n.startswith('_'))}\n"
                 "  update the entry point here and in configs/models.yaml together.")
-        self.model = getattr(timesfm, entry)()
-        for loader in ("load_checkpoint", "compile"):
-            if hasattr(self.model, loader):
-                with contextlib.suppress(Exception):
-                    getattr(self.model, loader)()
-        native = list(getattr(self.model, "quantiles", TIMESFM_NATIVE_GRID))
+        cls = getattr(timesfm, entry)
+
+        # Named, never defaulted: see TIMESFM_CHECKPOINT.
+        if hasattr(cls, "from_pretrained"):
+            self.model = cls.from_pretrained(TIMESFM_CHECKPOINT,
+                                             device=self.device)
+        else:
+            self.model = cls(checkpoint_path=TIMESFM_CHECKPOINT)
+        print(f"    checkpoint    {TIMESFM_CHECKPOINT} (passed explicitly)")
+        self._assert_checkpoint_is_the_pinned_one()
+
+        self.method_name, self.method = _discover_inference_method(
+            self.model, TIMESFM_METHOD_PREFERENCE, entry)
+
+        config = getattr(self.model, "config", None)
+        native = list(getattr(config, "quantiles", None)
+                      or getattr(self.model, "quantiles", TIMESFM_NATIVE_GRID))
+        # Not hardcoded. timesfm3's _ModelConfig says median_quantile_index 4
+        # while the 2.5 model definition says decode_index 5 over a 10-channel
+        # head - two different layouts. Which one this checkpoint returns is
+        # settled in predict(), against the library's own `forecast` field.
+        self.median_index_hint = getattr(config, "median_quantile_index", None)
+        self.channel_layout = None
+        print(f"    median hint   config.median_quantile_index="
+              f"{self.median_index_hint} (verified against the returned "
+              "point forecast on the first batch)")
         print(f"    native grid   {len(native)} levels: {native}")
         if not np.allclose(native, TIMESFM_NATIVE_GRID, atol=1e-12):
             raise SystemExit(
@@ -471,20 +509,121 @@ class TimesFMAdapter(Adapter):
         print(f"    frozen grid   direct {self.direct} | "
               f"interpolated {self.interpolated} | NaN {self.unavailable}")
 
-    def predict(self, contexts: np.ndarray) -> tuple[np.ndarray, dict]:
-        point, quantiles = self.model.forecast(
-            horizon=1, inputs=[row for row in contexts])
-        quantiles = np.asarray(quantiles)
-        n = len(contexts)
-        if quantiles.ndim != 3 or quantiles.shape[0] != n:
-            raise AssertionError(f"unexpected TimesFM output {quantiles.shape}")
-        if quantiles.shape[-1] != len(self.native) + 1:
+    def _assert_checkpoint_is_the_pinned_one(self) -> None:
+        """The loaded checkpoint must be the one the roster names."""
+        config = getattr(self.model, "config", None)
+        loaded = getattr(config, "checkpoint_path", None)
+        if loaded is not None and str(loaded) != TIMESFM_CHECKPOINT:
+            raise SystemExit(
+                f"TimesFM loaded {loaded!r}, not the pre-registered "
+                f"{TIMESFM_CHECKPOINT!r}. The config default is a different "
+                "model generation and its output shape is close enough that "
+                "nothing downstream would catch the substitution.")
+
+    def _call(self, contexts: np.ndarray):
+        """Invoke whichever method discovery found, with its own argument shape."""
+        rows = [np.asarray(row, dtype=np.float32) for row in contexts]
+        if self.method_name == "predict_batch":
+            return list(self.method(contexts=rows, horizon=1,
+                                    return_quantiles=True))
+        if self.method_name == "predict":
+            return [self.method(context=row, horizon=1, return_quantiles=True)
+                    for row in rows]
+        if self.method_name == "forecast":
+            return self.method(horizon=1, inputs=rows)
+        return self.method(rows, 1)
+
+    def _as_arrays(self, outputs, n: int) -> tuple[np.ndarray, np.ndarray]:
+        """Normalise to ``(quantiles (n, C), point (n,))`` across return shapes.
+
+        ``predict``/``predict_batch`` yield ``ForecastOutput`` objects carrying
+        ``.quantiles`` and ``.forecast``; the older ``forecast`` method returns a
+        ``(point, quantiles)`` pair. Both are reduced to the same two arrays so
+        the level mapping below has one code path.
+        """
+        if isinstance(outputs, tuple) and len(outputs) == 2:
+            point, quantiles = outputs
+            quantiles = np.asarray(quantiles)
+            if quantiles.ndim == 3:                     # (n, horizon, C)
+                quantiles = quantiles[:, 0, :]
+            return quantiles, np.asarray(point).reshape(n, -1)[:, 0]
+
+        if not isinstance(outputs, (list, tuple)) or len(outputs) != n:
             raise AssertionError(
-                f"TimesFM last axis is {quantiles.shape[-1]}, expected "
-                f"{len(self.native) + 1} (point channel + {len(self.native)} "
-                "quantiles) per timesfm_2p5_torch.py:53")
-        native_values = quantiles[:, 0, 1:]               # drop channel 0, the point
-        del point
+                f"{self.method_name} returned {type(outputs).__name__} of "
+                f"length {len(outputs) if hasattr(outputs, '__len__') else '?'}, "
+                f"expected {n} per-series results")
+
+        quantiles, point = [], []
+        for item in outputs:
+            q = getattr(item, "quantiles", None)
+            if q is None:
+                raise AssertionError(
+                    f"{self.method_name} returned no quantiles. It must be "
+                    "called with return_quantiles=True; without it the field "
+                    "is None and only the point forecast comes back.")
+            q = np.asarray(q)
+            quantiles.append(q[0] if q.ndim == 2 else q)     # (horizon, C) -> (C,)
+            f = np.asarray(getattr(item, "forecast"))
+            point.append(float(f.reshape(-1)[0]))
+        return np.stack(quantiles, axis=0), np.asarray(point)
+
+    def _resolve_layout(self, quantiles: np.ndarray, point: np.ndarray) -> int:
+        """Which channels are the quantiles, settled against the library itself.
+
+        Two layouts are documented in the same package: a 10-channel head whose
+        channel 0 is the point forecast and whose channels 1..9 are the deciles
+        (``timesfm_2p5_torch.py:53``, ``decode_index 5``), and a 9-channel one
+        indexed directly by level (``_ModelConfig.median_quantile_index 4``).
+        Guessing between them shifts every level by one and changes no shape.
+
+        So it is decided by evidence: the library's own ``forecast`` field is by
+        construction the median channel, so the offset is whichever one puts the
+        median where ``forecast`` already is.
+        """
+        n_native = len(self.native)
+        n_channels = quantiles.shape[-1]
+        median_at = int(np.flatnonzero(
+            np.isclose(np.asarray(self.native), 0.5, atol=1e-12))[0])
+
+        candidates = []
+        if n_channels == n_native:
+            candidates.append((0, "channels are the quantiles, one per level"))
+        if n_channels == n_native + 1:
+            candidates.append((1, "channel 0 is the point forecast, 1.. the levels"))
+        if not candidates:
+            raise AssertionError(
+                f"TimesFM returned {n_channels} channels, which is neither "
+                f"{n_native} (one per level) nor {n_native + 1} (point channel "
+                f"plus levels). Native grid {self.native}.")
+
+        for offset, description in candidates:
+            median_channel = quantiles[:, offset + median_at]
+            if np.allclose(median_channel, point, rtol=1e-4, atol=1e-8):
+                print(f"    layout        {n_channels} channels, offset "
+                      f"{offset} - {description}; median channel matches the "
+                      "returned point forecast")
+                return offset
+
+        raise AssertionError(
+            f"could not identify the quantile channels: with {n_channels} "
+            f"channels none of the candidate offsets {[c[0] for c in candidates]} "
+            "puts the median where the library's own point forecast is. "
+            "Mapping levels on an unverified offset would shift every quantile "
+            "by one and raise nothing.")
+
+    def predict(self, contexts: np.ndarray) -> tuple[np.ndarray, dict]:
+        n = len(contexts)
+        raw = self._call(contexts)
+        quantiles, point = self._as_arrays(raw, n)
+        if quantiles.shape[0] != n:
+            raise AssertionError(
+                f"TimesFM returned {quantiles.shape[0]} rows for {n} contexts")
+
+        if self.channel_layout is None:
+            self.channel_layout = self._resolve_layout(quantiles, point)
+        offset = self.channel_layout
+        native_values = quantiles[:, offset:offset + len(self.native)]
 
         out = np.full((n, len(self.our_grid)), np.nan)
         native = np.asarray(self.native)
@@ -632,6 +771,58 @@ KRONOS_INFERENCE_PARAMS = (
     "clip", "T", "top_k", "top_p", "sample_count", "verbose")
 
 
+def _inference_surface(obj) -> list[str]:
+    """Public names plus the signature of anything that looks like inference.
+
+    Printed on discovery failure, in the same shape as the entry-point dump that
+    settled ``TimesFM3Forecaster`` the first time. The point is that the next
+    person reads the real namespace off the run instead of guessing a second
+    time - guessing is what produced ``.forecast``, which is the TimesFM_2p5
+    base-class method and not on the forecaster at all.
+    """
+    public = sorted(m for m in dir(obj) if not m.startswith("_"))
+    lines = [f"    public attributes: {public}"]
+    interesting = [m for m in public + ["__call__"]
+                   if any(hint in m.lower() for hint in INFERENCE_NAME_HINTS)]
+    for name in interesting:
+        attr = getattr(obj, name, None)
+        if not callable(attr):
+            continue
+        try:
+            sig = str(inspect.signature(attr))
+        except (TypeError, ValueError):                 # builtins, C callables
+            sig = "(signature unavailable)"
+        lines.append(f"      {name}{sig}")
+    return lines
+
+
+def _discover_inference_method(model, preference, entry_name: str):
+    """The first method in ``preference`` the object actually has.
+
+    Dispatch is by preference order rather than by a single hardcoded name, and
+    the chosen name is printed so it lands in the run log and can be recorded in
+    the frozen spec afterwards.
+    """
+    for name in preference:
+        attr = getattr(model, name, None)
+        if callable(attr):
+            try:
+                sig = str(inspect.signature(attr))
+            except (TypeError, ValueError):
+                sig = "(signature unavailable)"
+            print(f"    inference     {entry_name}.{name}{sig}")
+            print(f"    RECORD THIS   TimesFM inference method = {name!r} "
+                  "- add it to configs/models.yaml and registry.py together")
+            return name, attr
+
+    surface = "\n".join(_inference_surface(model))
+    raise SystemExit(
+        f"{entry_name} exposes none of {list(preference)}.\n{surface}\n"
+        "  Pick the right method from the signatures above, add it to "
+        "TIMESFM_METHOD_PREFERENCE, and record it in configs/models.yaml and "
+        "registry.py together.")
+
+
 def _is_oom(exc: BaseException) -> bool:
     """CUDA OOM across torch versions.
 
@@ -699,6 +890,7 @@ class KronosAdapter(Adapter):
         self.sequence_budget = sequence_budget
         self.kronos_path = kronos_path
         self.budget_was_reduced = False
+        self._reported_working_size = False
 
     @property
     def origin_batch(self) -> int:
@@ -802,43 +994,68 @@ class KronosAdapter(Adapter):
         so nothing outside the window enters) and its denormalisation, but keeps
         the sample axis in between.
         """
-        try:
-            return self._predict_bars(windows, x_stamps, y_stamps, last_close)
-        except RuntimeError as exc:
-            if not _is_oom(exc):
-                raise
-            # Measured, not guessed: halve the budget, say so, and try once more.
-            # The reduced budget persists, so the rest of the run uses the size
-            # that actually fit rather than rediscovering this every batch.
-            self._free()
-            before = self.sequence_budget
-            self.sequence_budget = max(MIN_KRONOS_SEQUENCE_BUDGET, before // 2)
-            self.paths_per_call = max(1, min(self.paths_per_call,
-                                             self.sequence_budget))
-            self.budget_was_reduced = True
-            print(f"      OOM at {before} sequences/call "
-                  f"({len(windows)} origins x {self.paths_per_call} paths). "
-                  f"Retrying at budget {self.sequence_budget} "
-                  f"-> {self.origin_batch} x {self.paths_per_call} = "
-                  f"{self.origin_batch * self.paths_per_call}.")
-            if self.sequence_budget >= before:
-                raise SystemExit(
-                    f"Kronos ran out of memory at the floor budget "
-                    f"{MIN_KRONOS_SEQUENCE_BUDGET} and cannot be reduced "
-                    f"further.\n  {exc}") from exc
-
-            step = max(1, self.origin_batch)
-            parts = []
-            for start in range(0, len(windows), step):
-                stop = start + step
-                part, _ = self._predict_bars(
-                    windows[start:stop], x_stamps[start:stop],
-                    y_stamps[start:stop], last_close[start:stop])
-                parts.append(part)
+        # Back off repeatedly, not once. Halving a single time and giving up is
+        # only correct if the first guess was within a factor of two; it was not
+        # on the T4, where 4000 and 2000 sequences both failed. The loop walks
+        # the budget down to the floor, reports each step, and only fails when
+        # the floor itself cannot run - so the working size is measured rather
+        # than assumed, and a run that could have completed does not abort.
+        while True:
+            try:
+                levels, extras = self._run_in_batches(
+                    windows, x_stamps, y_stamps, last_close)
+                if self.budget_was_reduced and not self._reported_working_size:
+                    print(f"      settled at {self.origin_batch} origins x "
+                          f"{self.paths_per_call} paths = "
+                          f"{self.origin_batch * self.paths_per_call} "
+                          "sequences/call")
+                    self._reported_working_size = True
+                return levels, extras
+            except RuntimeError as exc:
+                if not _is_oom(exc):
+                    raise
                 self._free()
-            print(f"      retry succeeded at "
-                  f"{self.origin_batch * self.paths_per_call} sequences/call")
-            return np.concatenate(parts, axis=0), {}
+                before = self.sequence_budget
+                if before <= MIN_KRONOS_SEQUENCE_BUDGET:
+                    raise SystemExit(
+                        f"Kronos ran out of memory at the floor budget of "
+                        f"{MIN_KRONOS_SEQUENCE_BUDGET} sequences/call "
+                        f"({self.origin_batch} origins x "
+                        f"{self.paths_per_call} paths), which is the smallest "
+                        "this runner will attempt. The context window or the "
+                        "card is the binding constraint, not the batching.\n"
+                        f"  {exc}") from exc
+                self.sequence_budget = max(MIN_KRONOS_SEQUENCE_BUDGET,
+                                           before // 2)
+                self.paths_per_call = max(1, min(self.paths_per_call,
+                                                 self.sequence_budget))
+                self.budget_was_reduced = True
+                self._reported_working_size = False
+                print(f"      OOM at {before} sequences/call; backing off to "
+                      f"{self.sequence_budget} -> {self.origin_batch} origins "
+                      f"x {self.paths_per_call} paths = "
+                      f"{self.origin_batch * self.paths_per_call} sequences")
+
+    def _run_in_batches(self, windows: np.ndarray, x_stamps: np.ndarray,
+                        y_stamps: np.ndarray, last_close: np.ndarray,
+                        ) -> tuple[np.ndarray, dict]:
+        """The caller's block, re-split at the current origin batch.
+
+        After a backoff the incoming block may be wider than the budget now
+        allows, so it is re-split here rather than handed back to the caller.
+        """
+        step = max(1, self.origin_batch)
+        if step >= len(windows):
+            return self._predict_bars(windows, x_stamps, y_stamps, last_close)
+        parts = []
+        for start in range(0, len(windows), step):
+            stop = start + step
+            part, _ = self._predict_bars(
+                windows[start:stop], x_stamps[start:stop],
+                y_stamps[start:stop], last_close[start:stop])
+            parts.append(part)
+            self._free()
+        return np.concatenate(parts, axis=0), {}
 
     def _predict_bars(self, windows: np.ndarray, x_stamps: np.ndarray,
                       y_stamps: np.ndarray, last_close: np.ndarray,
@@ -963,6 +1180,8 @@ def forecast_fold(adapter: Adapter, bars: pd.DataFrame, split, our_grid,
     frames = []
     grouped = bars.groupby("unique_id", sort=True)
     names = tickers if tickers is not None else sorted(bars["unique_id"].unique())
+    skipped = {"short_history": 0, "short_history_tickers": set(),
+               "no_forward_return": 0, "no_forward_return_tickers": set()}
 
     for ticker in names:
         group = grouped.get_group(ticker).sort_values("ds").reset_index(drop=True)
@@ -971,19 +1190,22 @@ def forecast_fold(adapter: Adapter, bars: pd.DataFrame, split, our_grid,
         if in_window.size == 0:
             continue
         usable = in_window[in_window >= adapter.context]
-        dropped = in_window.size - usable.size
-        if dropped:
-            print(f"      {ticker}: {dropped} origins lack {adapter.context} "
-                  "sessions of history, skipped")
+        skipped["short_history"] += in_window.size - usable.size
+        if in_window.size - usable.size:
+            skipped["short_history_tickers"].add(ticker)
         # An origin at the final session of the panel has no t+1, so
         # make_target leaves its label NaN and there is nothing to score the
         # forecast against - evaluate.py refuses a forecast with no outcome.
         # This is what makes the count 1,669 sessions per ticker rather than the
         # 1,670 in the windows, and it matches what the existing tiers write.
+        #
+        # Counted, not printed per ticker. On the last fold every one of the
+        # fifty hits this, and one identical line each is fifty lines per model,
+        # 950 across the roster - enough noise to bury something that matters.
         labelled = usable[usable < len(group) - 1]
         if labelled.size != usable.size:
-            print(f"      {ticker}: {usable.size - labelled.size} origin at the "
-                  "final session has no forward return, skipped")
+            skipped["no_forward_return"] += usable.size - labelled.size
+            skipped["no_forward_return_tickers"].add(ticker)
         usable = labelled
         if usable.size == 0:
             continue
@@ -1045,6 +1267,17 @@ def forecast_fold(adapter: Adapter, bars: pd.DataFrame, split, our_grid,
         for col, parts in extras_acc.items():
             out[col] = np.concatenate(parts)
         frames.append(out)
+
+    # One line per reason for the whole fold, naming the count of tickers rather
+    # than each of them.
+    if skipped["short_history"]:
+        print(f"      skipped {skipped['short_history']:,} origins across "
+              f"{len(skipped['short_history_tickers'])} tickers: fewer than "
+              f"{adapter.context} sessions of history")
+    if skipped["no_forward_return"]:
+        print(f"      skipped {skipped['no_forward_return']:,} origins across "
+              f"{len(skipped['no_forward_return_tickers'])} tickers: final "
+              "session has no forward return, so no label to score against")
 
     if not frames:
         return pd.DataFrame()

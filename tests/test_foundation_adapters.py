@@ -256,6 +256,145 @@ def test_oom_is_recognised_across_torch_versions():
     assert isinstance(OutOfMemoryError("x"), RuntimeError)
 
 
+def test_backoff_walks_down_to_a_size_that_fits_rather_than_halving_once():
+    """The bug this replaces: one halving, then a crash.
+
+    On the T4 both 4,000 and 2,000 sequences failed, so a single halving from an
+    over-large start still OOMs and the run died with work left it could have
+    done. The loop must keep backing off until something runs.
+    """
+    adapter = _adapter(500, 64, 512)
+    fits_at = 128
+    attempts = []
+
+    def fake_predict_bars(windows, x_stamps, y_stamps, last_close):
+        attempts.append(adapter.origin_batch * adapter.paths_per_call)
+        if attempts[-1] > fits_at:
+            raise RuntimeError("CUDA out of memory. Tried to allocate 1.95 GiB")
+        return np.zeros((len(windows), 3)), {}
+
+    adapter._predict_bars = fake_predict_bars
+    levels, _ = adapter.predict_bars(np.zeros((2, 4, 6)), np.zeros((2, 4, 3)),
+                                     np.zeros((2, 1, 3)), np.ones(2))
+    assert levels.shape == (2, 3)
+    assert attempts[0] > fits_at, "the first attempt should be the oversized one"
+    assert attempts[-1] <= fits_at
+    assert len(attempts) > 2, f"must back off more than once, got {attempts}"
+    assert adapter.budget_was_reduced
+
+
+def test_backoff_stops_at_the_floor_instead_of_looping_forever():
+    adapter = _adapter(500, 64, 128)
+
+    def always_oom(windows, x_stamps, y_stamps, last_close):
+        raise RuntimeError("CUDA out of memory")
+
+    adapter._predict_bars = always_oom
+    with pytest.raises(SystemExit, match="floor budget"):
+        adapter.predict_bars(np.zeros((2, 4, 6)), np.zeros((2, 4, 3)),
+                             np.zeros((2, 1, 3)), np.ones(2))
+    assert adapter.sequence_budget == runner.MIN_KRONOS_SEQUENCE_BUDGET
+
+
+def test_a_non_memory_runtime_error_is_not_swallowed_by_the_backoff():
+    adapter = _adapter(500, 64, 512)
+
+    def wrong_shape(windows, x_stamps, y_stamps, last_close):
+        raise RuntimeError("shape mismatch: expected 3 dims")
+
+    adapter._predict_bars = wrong_shape
+    with pytest.raises(RuntimeError, match="shape mismatch"):
+        adapter.predict_bars(np.zeros((2, 4, 6)), np.zeros((2, 4, 3)),
+                             np.zeros((2, 1, 3)), np.ones(2))
+    assert not adapter.budget_was_reduced
+
+
+# --------------------------------------------------------------------------
+# 4. TimesFM: the method name and the channel layout are discovered, not assumed
+# --------------------------------------------------------------------------
+
+class _Surface:
+    """An object exposing a chosen subset of plausible inference methods."""
+
+    def __init__(self, *names):
+        for name in names:
+            setattr(self, name, lambda *a, **k: None)
+
+
+def test_discovery_prefers_the_batched_entry_point():
+    name, _ = runner._discover_inference_method(
+        _Surface("predict", "predict_batch", "compile"),
+        runner.TIMESFM_METHOD_PREFERENCE, "TimesFM3Forecaster")
+    assert name == "predict_batch"
+
+
+def test_discovery_falls_back_through_the_preference_order():
+    name, _ = runner._discover_inference_method(
+        _Surface("forecast", "compile"),
+        runner.TIMESFM_METHOD_PREFERENCE, "TimesFM3Forecaster")
+    assert name == "forecast"
+
+
+def test_discovery_failure_attaches_the_namespace_instead_of_guessing():
+    """What the AttributeError on Kaggle should have produced the first time."""
+    with pytest.raises(SystemExit) as excinfo:
+        runner._discover_inference_method(
+            _Surface("compile", "load_checkpoint"),
+            runner.TIMESFM_METHOD_PREFERENCE, "TimesFM3Forecaster")
+    message = str(excinfo.value)
+    assert "public attributes" in message
+    assert "compile" in message and "load_checkpoint" in message
+
+
+def test_the_pinned_checkpoint_is_never_left_to_the_config_default():
+    """The default is a different model generation with a compatible shape."""
+    assert runner.TIMESFM_CHECKPOINT == "google/timesfm-2.5-200m-pytorch"
+    assert "3.0" not in runner.TIMESFM_CHECKPOINT
+
+
+def _timesfm_adapter():
+    adapter = runner.TimesFMAdapter(
+        our_grid=(0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99),
+        context=512, device="cpu", batch=32)
+    adapter.native = list(runner.TIMESFM_NATIVE_GRID)
+    adapter.channel_layout = None
+    return adapter
+
+
+def test_layout_resolved_for_a_ten_channel_head_with_a_point_channel():
+    """timesfm_2p5_torch.py:53 - len(quantiles) + 1 channels, median at 5."""
+    adapter = _timesfm_adapter()
+    levels = np.asarray(runner.TIMESFM_NATIVE_GRID)
+    rows = np.stack([np.concatenate([[0.5], levels]) for _ in range(4)])
+    point = np.full(4, 0.5)                     # the median level's value
+    assert adapter._resolve_layout(rows, point) == 1
+
+
+def test_layout_resolved_for_a_nine_channel_head_indexed_by_level():
+    """_ModelConfig.median_quantile_index 4 - one channel per level."""
+    adapter = _timesfm_adapter()
+    levels = np.asarray(runner.TIMESFM_NATIVE_GRID)
+    rows = np.stack([levels for _ in range(4)])
+    point = np.full(4, 0.5)
+    assert adapter._resolve_layout(rows, point) == 0
+
+
+def test_an_unverifiable_layout_raises_rather_than_shifting_every_level():
+    """The silent failure: an offset that is wrong by one changes no shape."""
+    adapter = _timesfm_adapter()
+    rows = np.stack([np.arange(10, dtype=float) for _ in range(4)])
+    point = np.full(4, 999.0)                   # matches no channel
+    with pytest.raises(AssertionError, match="could not identify"):
+        adapter._resolve_layout(rows, point)
+
+
+def test_an_unexpected_channel_count_is_rejected():
+    adapter = _timesfm_adapter()
+    rows = np.zeros((4, 5))
+    with pytest.raises(AssertionError, match="neither"):
+        adapter._resolve_layout(rows, np.zeros(4))
+
+
 def test_the_proxy_matches_the_chunk_extent_not_the_full_sample_count():
     """The trap introduced by chunking.
 
