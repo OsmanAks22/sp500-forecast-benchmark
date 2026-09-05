@@ -899,8 +899,11 @@ class KronosAdapter(Adapter):
 
     def __init__(self, our_grid, context, device, batch, sample_count,
                  paths_per_call=DEFAULT_KRONOS_PATHS_PER_CALL, kronos_path=None,
-                 sequence_budget=DEFAULT_KRONOS_SEQUENCE_BUDGET):
+                 sequence_budget=DEFAULT_KRONOS_SEQUENCE_BUDGET,
+                 precision="fp16", verification=None):
         super().__init__(our_grid, context, device, batch)
+        self.precision = precision
+        self.verification = verification
         self.sample_count = sample_count
         # Clamped by both: more paths than exist is meaningless, and a chunk
         # wider than the whole budget would make the printed origin batch a
@@ -970,6 +973,17 @@ class KronosAdapter(Adapter):
               "compute, on the full test period rather than a narrower window")
         for line in _wrap_text(KRONOS_SAMPLE_RATIONALE, 74):
             print(f"                  {line}")
+        print(f"    precision     {self.precision} on the inference call only; "
+              "normalisation, denormalisation and quantiles stay fp64")
+        if self.verification:
+            for line in _wrap_text(self.verification, 74):
+                print(f"                  {line}")
+        elif self.precision == "fp16":
+            print("                  NOT VERIFIED against fp32 for this run - "
+                  "Kronos is a sampler, so fp16")
+            print("                  changes which paths are drawn. Run "
+                  "--calibrate with --calib-precisions")
+            print("                  fp32 fp16 first, or pass --precision fp32.")
         # Printed before the first call, because the product is the number that
         # decides whether this fits in the card and it is not either input.
         print(f"    memory        paths/call {self.paths_per_call} "
@@ -978,6 +992,22 @@ class KronosAdapter(Adapter):
               f"{self.context} bars per call "
               f"(budget {self.sequence_budget})")
         print(f"    sample chunks {len(chunks)} per origin batch: {chunks}")
+
+    def _autocast(self):
+        """Half precision for the forward pass only, and only on CUDA.
+
+        Deliberately the narrowest possible scope. Kronos is a sampler, so fp16
+        does not merely run the same arithmetic faster - it changes which paths
+        are drawn, and a quantile built from different paths is a different
+        estimate. Everything whose precision the reported numbers are actually
+        made of stays in fp32 or wider: the per-window normalisation before the
+        call, the denormalisation after it, and the quantile computation. Those
+        are cheap, so there is nothing to win by degrading them and a
+        systematically shifted tail to lose.
+        """
+        if self.precision == "fp16" and self.device.startswith("cuda"):
+            return self.torch.autocast("cuda", dtype=self.torch.float16)
+        return contextlib.nullcontext()
 
     @contextlib.contextmanager
     def _keep_sample_axis(self, sample_extent: int):
@@ -1115,7 +1145,7 @@ class KronosAdapter(Adapter):
                 # samples that look entirely reasonable; by keyword it raises.
                 # The proxy matches on `chunk`, not self.sample_count.
                 with self._keep_sample_axis(chunk):
-                    with self.torch.no_grad():
+                    with self.torch.no_grad(), self._autocast():
                         paths = self.kronos_module.auto_regressive_inference(
                             tokenizer=self.predictor.tokenizer,
                             model=self.predictor.model,
@@ -1132,13 +1162,31 @@ class KronosAdapter(Adapter):
                             verbose=False,
                         )
 
-                paths = np.asarray(paths)
+                # Back to fp64 immediately. Under autocast the decode returns
+                # fp16, and everything from here on - denormalisation onto price
+                # scale, the log return, the quantile - is what the reported
+                # numbers are made of.
+                paths = np.asarray(paths, dtype=np.float64)
                 if paths.ndim != 4 or paths.shape[0] != n or paths.shape[1] != chunk:
                     raise AssertionError(
                         f"Kronos returned {paths.shape}; expected "
                         f"({n}, {chunk}, steps, features). The sample axis was "
                         "collapsed - _keep_sample_axis did not take effect, and "
                         "the quantiles would be copies of a mean path.")
+
+                # fp16 has a maximum around 65,504, and these are price-scale
+                # tensors. An overflow yields inf, np.quantile of an array
+                # containing inf returns inf or a finite value drawn from the
+                # wrong order statistics, and either way it reaches the parquet
+                # looking like a number. Checked here rather than trusted.
+                if not np.isfinite(paths).all():
+                    bad = int((~np.isfinite(paths)).sum())
+                    raise SystemExit(
+                        f"Kronos returned {bad:,} non-finite values of "
+                        f"{paths.size:,} at precision {self.precision}. In "
+                        "fp16 this is overflow on a price-scale tensor; the "
+                        "quantiles built from it would be silently wrong. "
+                        "Re-run this model with --precision fp32.")
 
                 # Reduce to the one column that is needed before anything else is
                 # kept, so the full (n, chunk, steps, features) block can go.
@@ -1177,6 +1225,16 @@ class KronosAdapter(Adapter):
             # without the reader having to reconstruct it from the history.
             "sample_count_chosen_for": "compute",
             "evaluation_window": "full test period (not the clean slice)",
+            "precision": self.precision,
+            "precision_scope": (
+                "autocast applies to the inference call only; the per-window "
+                "normalisation, the denormalisation and the quantile "
+                "computation are fp64"),
+            "precision_verification": self.verification or (
+                "NOT VERIFIED - no fp32/fp16 comparison was supplied for this "
+                "run. Kronos is a sampler, so fp16 changes which paths are "
+                "drawn and not merely how fast; a CRPS from fp16 paths is only "
+                "defensible alongside a measured comparison against fp32."),
             "tail_bias": "inward",
             "tail_bias_direction": (
                 "penalises this model: finite-sample extreme quantiles are "
@@ -1199,6 +1257,32 @@ class KronosAdapter(Adapter):
 # the run
 # --------------------------------------------------------------------------
 
+def _load_precision_verification(args) -> str | None:
+    """The fp32/fp16 verdict from a prior calibration, if one is there.
+
+    Copied rather than retyped so the sentence in grid.json is the one the
+    measurement actually produced. Absent, mismatched or unverified all mean the
+    forecasts record that no verification backs them - which is the honest state
+    of an fp16 run nobody checked.
+    """
+    if args.precision != "fp16":
+        return f"precision {args.precision}; no autocast, so nothing to verify"
+    path = Path(args.precision_verification)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        print(f"  ! {path} is not valid JSON; treating fp16 as unverified")
+        return None
+    sentence = payload.get("precision_verification")
+    if not sentence:
+        return None
+    if payload.get("precision_within_noise") is False:
+        print(f"  ! {show(path)} says the fp16 shift EXCEEDED the noise floor")
+    return f"{sentence} [from {show(path)}]"
+
+
 def make_adapter(name: str, our_grid, args) -> Adapter:
     if name == "Chronos-2":
         return ChronosAdapter(our_grid, args.context, args.device, args.batch_size)
@@ -1209,7 +1293,9 @@ def make_adapter(name: str, our_grid, args) -> Adapter:
     if name == "Kronos-small":
         return KronosAdapter(our_grid, args.context, args.device, args.batch_size,
                              args.sample_count, args.kronos_paths_per_call,
-                             args.kronos_path, args.kronos_sequence_budget)
+                             args.kronos_path, args.kronos_sequence_budget,
+                             precision=args.precision,
+                             verification=_load_precision_verification(args))
     raise SystemExit(f"{name} is not a foundation model in this runner")
 
 
@@ -1377,6 +1463,8 @@ def run_model(adapter: Adapter, bars: pd.DataFrame, walk_forward: PurgedWalkForw
             "paths_per_call": getattr(adapter, "paths_per_call", None),
             "sequence_budget": getattr(adapter, "sequence_budget", None),
             "budget_reduced_after_oom": getattr(adapter, "budget_was_reduced", None),
+            "precision": getattr(adapter, "precision", None),
+            "precision_verification": getattr(adapter, "verification", None),
             "peak_gpu_gib": (adapter.peak_memory_gib()
                              if hasattr(adapter, "peak_memory_gib") else None),
             "partial": True,
@@ -1400,6 +1488,8 @@ def run_model(adapter: Adapter, bars: pd.DataFrame, walk_forward: PurgedWalkForw
         "paths_per_call": getattr(adapter, "paths_per_call", None),
         "sequence_budget": getattr(adapter, "sequence_budget", None),
         "budget_reduced_after_oom": getattr(adapter, "budget_was_reduced", None),
+        "precision": getattr(adapter, "precision", None),
+        "precision_verification": getattr(adapter, "verification", None),
         "peak_gpu_gib": (adapter.peak_memory_gib()
                          if hasattr(adapter, "peak_memory_gib") else None),
         "partial": False,
@@ -1412,6 +1502,95 @@ def run_model(adapter: Adapter, bars: pd.DataFrame, walk_forward: PurgedWalkForw
 # --------------------------------------------------------------------------
 # calibration
 # --------------------------------------------------------------------------
+
+def _precision_verdicts(rows: list[dict], repeats: int) -> dict:
+    """Is the fp32 -> fp16 CRPS shift bigger than fp32's own run-to-run spread?
+
+    Kronos draws different paths on every call, so two fp32 runs on the same
+    origins already disagree. That disagreement is the sampling noise floor, and
+    it is the only honest reference for the precision difference: a shift
+    smaller than the noise is not evidence that fp16 changed the estimate, and a
+    shift larger than it is.
+
+    Hence ``--calib-repeats`` defaulting to 2. With one run per precision there
+    is no noise estimate at all, and the comparison would be a bare difference
+    with nothing to read it against - which is exactly the kind of number that
+    looks like evidence and is not.
+    """
+    report: list[str] = []
+    verdict = {"report": report, "sentence": None, "within_noise": None}
+
+    by_sample: dict[int, dict[str, list[float]]] = {}
+    for row in rows:
+        by_sample.setdefault(row["sample_count"], {}).setdefault(
+            row["precision"], []).append(row["crps"])
+
+    for sample_count, by_precision in sorted(by_sample.items()):
+        if set(by_precision) < {"fp32", "fp16"}:
+            continue
+        fp32, fp16 = by_precision["fp32"], by_precision["fp16"]
+        mean32 = float(np.mean(fp32))
+        mean16 = float(np.mean(fp16))
+        shift = abs(mean16 - mean32)
+        # Noise floor: the widest within-precision spread seen. Conservative -
+        # it is easier for a real shift to clear a small floor than a large one,
+        # so taking the larger spread makes the "within noise" verdict harder to
+        # earn, not easier.
+        spreads = [max(v) - min(v) for v in (fp32, fp16) if len(v) > 1]
+        noise = max(spreads) if spreads else float("nan")
+
+        report.append("")
+        report.append("=" * 78)
+        report.append(f"PRECISION COMPARISON at S={sample_count}, "
+                      f"{repeats} run(s) per precision, identical origins")
+        report.append("=" * 78)
+        report.append(f"  fp32 CRPS   {mean32:.6f}   runs {[f'{v:.6f}' for v in fp32]}")
+        report.append(f"  fp16 CRPS   {mean16:.6f}   runs {[f'{v:.6f}' for v in fp16]}")
+        report.append(f"  shift       {shift:.6f}  ({shift / mean32 * 100:+.3f}% "
+                      "of fp32)")
+        if not np.isfinite(noise):
+            report.append("  noise       not measured - only one run per "
+                          "precision, so there is nothing to read the shift")
+            report.append("              against. Re-run with --calib-repeats 2.")
+            continue
+        report.append(f"  noise floor {noise:.6f}  (widest within-precision "
+                      "spread, same origins)")
+
+        within = shift <= noise
+        verdict["within_noise"] = bool(within)
+        if within:
+            sentence = (
+                f"fp16 verified against fp32 on fold 0 at S={sample_count}: "
+                f"CRPS {mean16:.6f} vs {mean32:.6f}, a shift of {shift:.6f} "
+                f"({shift / mean32 * 100:+.3f}%), within the {noise:.6f} "
+                "run-to-run spread of fp32 against itself on the same origins. "
+                "The precision change is not distinguishable from resampling "
+                "noise at this sample count.")
+            report.append("")
+            report.append("  VERDICT: within sampling noise. fp16 is defensible "
+                          "here, and the sentence")
+            report.append("  below is written into grid.json and the run log.")
+        else:
+            sentence = (
+                f"fp16 NOT verified on fold 0 at S={sample_count}: CRPS "
+                f"{mean16:.6f} vs fp32 {mean32:.6f}, a shift of {shift:.6f} "
+                f"({shift / mean32 * 100:+.3f}%), LARGER than the {noise:.6f} "
+                "run-to-run spread of fp32 on the same origins. The speed is "
+                "not free: fp16 moves the estimate by more than resampling "
+                "does.")
+            report.append("")
+            report.append("  VERDICT: the shift EXCEEDS the noise floor. fp16 "
+                          "changes the estimate by")
+            report.append("  more than resampling does - do not spend the quota "
+                          "on it without deciding")
+            report.append("  that the shift is acceptable. --precision fp32 "
+                          "remains available.")
+        verdict["sentence"] = sentence
+        report.append("")
+        for line in _wrap_text(sentence, 74):
+            report.append(f"    {line}")
+    return verdict
+
 
 def calibrate(bars: pd.DataFrame, feats: pd.DataFrame, walk_forward, our_grid,
               args) -> None:
@@ -1440,9 +1619,12 @@ def calibrate(bars: pd.DataFrame, feats: pd.DataFrame, walk_forward, our_grid,
 
     rows = []
     for s in args.calib_sample_counts:
+      for precision in args.calib_precisions:
+       for repeat in range(args.calib_repeats):
         adapter = KronosAdapter(our_grid, args.context, args.device,
                                 args.batch_size, s, args.kronos_paths_per_call,
-                                args.kronos_path, args.kronos_sequence_budget)
+                                args.kronos_path, args.kronos_sequence_budget,
+                                precision=precision)
         adapter.load()
         adapter.reset_peak_memory()
         t0 = time.perf_counter()
@@ -1460,31 +1642,36 @@ def calibrate(bars: pd.DataFrame, feats: pd.DataFrame, walk_forward, our_grid,
         per_origin = elapsed / max(1, len(usable))
         full_hours = per_origin * 50 * 1669 / 3600
         seqs = adapter.origin_batch * adapter.paths_per_call
-        rows.append((s, crps, elapsed, len(usable), per_origin, full_hours,
-                     peak_gib, seqs, adapter.budget_was_reduced))
-        print(f"  S={s:<5} CRPS {crps:.6f}  {elapsed:8.1f}s over {len(usable):,} "
-              f"origins  ({per_origin * 1000:.1f} ms/origin -> "
-              f"{full_hours:.1f} GPU-h for the full 83,450)  "
-              f"peak {peak_gib:.2f} GiB @ {seqs} seq/call"
+        rows.append({"sample_count": s, "precision": precision, "repeat": repeat,
+                     "crps": crps, "seconds": elapsed, "n_origins": len(usable),
+                     "seconds_per_origin": per_origin,
+                     "projected_full_run_gpu_hours": full_hours,
+                     "peak_gpu_gib": peak_gib, "sequences_per_call": seqs,
+                     "budget_reduced_after_oom": adapter.budget_was_reduced})
+        print(f"  S={s:<5} {precision:<5} run {repeat + 1}  CRPS {crps:.6f}  "
+              f"{elapsed:8.1f}s over {len(usable):,} origins  "
+              f"({per_origin * 1000:.1f} ms/origin -> {full_hours:.1f} GPU-h "
+              f"for the full 83,450)  peak {peak_gib:.2f} GiB @ {seqs} seq/call"
               f"{'  [budget reduced after OOM]' if adapter.budget_was_reduced else ''}")
         del adapter
 
-    print(f"\n{'S':>6}{'CRPS':>12}{'d vs prev':>12}{'ms/origin':>12}"
+    print(f"\n{'S':>6}{'prec':>7}{'run':>5}{'CRPS':>12}{'ms/origin':>12}"
           f"{'peak GiB':>10}{'seq/call':>10}{'full-run GPU-h':>16}")
-    prev = None
-    for s, crps, _, _, per_origin, full_hours, peak_gib, seqs, reduced in rows:
-        delta = "" if prev is None else f"{(crps - prev) / prev * 100:+.3f}%"
-        flag = " *" if reduced else ""
-        print(f"{s:>6}{crps:>12.6f}{delta:>12}{per_origin * 1000:>12.1f}"
-              f"{peak_gib:>10.2f}{seqs:>10}{full_hours:>16.1f}{flag}")
-        prev = crps
-    print("\nRead it as: if CRPS has stopped moving between the two largest S, "
-          "the smaller one is adequate and the difference is sampling noise, "
-          "not model uncertainty. The GPU-h column is measured, not assumed.")
-    print("peak GiB is torch.cuda.max_memory_allocated over the whole sweep step, "
-          "so it is the\nceiling the full run has to live under, at the "
-          "seq/call the row actually used.")
-    if any(r[-1] for r in rows):
+    for r in rows:
+        flag = " *" if r["budget_reduced_after_oom"] else ""
+        print(f"{r['sample_count']:>6}{r['precision']:>7}{r['repeat'] + 1:>5}"
+              f"{r['crps']:>12.6f}{r['seconds_per_origin'] * 1000:>12.1f}"
+              f"{r['peak_gpu_gib']:>10.2f}{r['sequences_per_call']:>10}"
+              f"{r['projected_full_run_gpu_hours']:>16.1f}{flag}")
+
+    verdicts = _precision_verdicts(rows, args.calib_repeats)
+    for line in verdicts["report"]:
+        print(line)
+
+    print("\npeak GiB is torch.cuda.max_memory_allocated over the sweep step, so "
+          "it is the ceiling\nthe full run has to live under, at the seq/call the "
+          "row actually used.")
+    if any(r["budget_reduced_after_oom"] for r in rows):
         print("* this row hit OOM and finished at a reduced budget; seq/call is "
               "the size that worked.")
 
@@ -1498,11 +1685,13 @@ def calibrate(bars: pd.DataFrame, feats: pd.DataFrame, walk_forward, our_grid,
         "device": args.device,
         "paths_per_call": args.kronos_paths_per_call,
         "sequence_budget": args.kronos_sequence_budget,
-        "rows": [{"sample_count": s, "crps": c, "seconds": e, "n_origins": n,
-                  "seconds_per_origin": p, "projected_full_run_gpu_hours": h,
-                  "peak_gpu_gib": g, "sequences_per_call": q,
-                  "budget_reduced_after_oom": r}
-                 for s, c, e, n, p, h, g, q, r in rows],
+        "precisions": list(args.calib_precisions),
+        "repeats_per_precision": args.calib_repeats,
+        # The sentence the real run copies into grid.json and prints, so the
+        # verification travels with the forecasts instead of being transcribed.
+        "precision_verification": verdicts["sentence"],
+        "precision_within_noise": verdicts["within_noise"],
+        "rows": rows,
         "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }, indent=2) + "\n")
     print(f"-> {show(out)}")
@@ -1612,6 +1801,22 @@ def parse_args() -> argparse.Namespace:
                    help="Kronos CRPS and wall-clock vs sample_count on one fold")
     p.add_argument("--calib-sample-counts", nargs="+", type=int,
                    default=[100, 200, 500])
+    p.add_argument("--precision", choices=["fp32", "fp16"], default="fp16",
+                   help="Kronos inference precision. fp16 uses autocast on the "
+                        "inference call only; normalisation, denormalisation "
+                        "and quantiles stay fp64. Kronos is a sampler, so this "
+                        "changes which paths are drawn - verify with "
+                        "--calibrate --calib-precisions fp32 fp16 (default fp16)")
+    p.add_argument("--precision-verification",
+                   default="results/kronos_calibration.json",
+                   help="calibration file whose fp32/fp16 verdict is copied "
+                        "into grid.json and the run log")
+    p.add_argument("--calib-precisions", nargs="+", default=["fp32", "fp16"],
+                   choices=["fp32", "fp16"])
+    p.add_argument("--calib-repeats", type=int, default=2,
+                   help="runs per precision. 2 or more gives a run-to-run "
+                        "spread to read the precision shift against; 1 gives a "
+                        "bare difference with no noise floor (default 2)")
     p.add_argument("--calib-tickers", type=int, default=5)
     p.add_argument("--calib-fold", type=int, default=0)
     p.add_argument("--calib-out", default="results/kronos_calibration.json")

@@ -395,6 +395,122 @@ def test_an_unexpected_channel_count_is_rejected():
         adapter._resolve_layout(rows, np.zeros(4))
 
 
+# --------------------------------------------------------------------------
+# 5. fp16 is a numerics change to a sampler, so it has to be evidenced
+# --------------------------------------------------------------------------
+
+def _rows(fp32_values, fp16_values, sample_count=100):
+    rows = []
+    for precision, values in (("fp32", fp32_values), ("fp16", fp16_values)):
+        for i, crps in enumerate(values):
+            rows.append({"sample_count": sample_count, "precision": precision,
+                         "repeat": i, "crps": crps, "seconds": 1.0,
+                         "n_origins": 253, "seconds_per_origin": 0.004,
+                         "projected_full_run_gpu_hours": 10.0,
+                         "peak_gpu_gib": 3.0, "sequences_per_call": 512,
+                         "budget_reduced_after_oom": False})
+    return rows
+
+
+def test_a_shift_smaller_than_the_noise_floor_is_declared_within_noise():
+    # fp32 disagrees with itself by 4e-6; fp16 sits 1e-6 from its mean.
+    rows = _rows([0.003700, 0.003704], [0.003703, 0.003701])
+    verdict = runner._precision_verdicts(rows, repeats=2)
+    assert verdict["within_noise"] is True
+    assert "verified against fp32" in verdict["sentence"]
+    assert "within the" in verdict["sentence"]
+
+
+def test_a_shift_larger_than_the_noise_floor_is_declared_not_verified():
+    # fp32 is stable to 1e-6, fp16 is 5e-5 away - an order of magnitude clear.
+    rows = _rows([0.003700, 0.003701], [0.003750, 0.003751])
+    verdict = runner._precision_verdicts(rows, repeats=2)
+    assert verdict["within_noise"] is False
+    assert "NOT verified" in verdict["sentence"]
+    assert "not free" in verdict["sentence"]
+
+
+def test_the_verdict_sentence_carries_both_figures_and_the_noise():
+    """The sentence is what makes the choice defensible, so it must be specific."""
+    rows = _rows([0.003700, 0.003704], [0.003702, 0.003703])
+    sentence = runner._precision_verdicts(rows, repeats=2)["sentence"]
+    assert "0.0037" in sentence                      # both CRPS figures
+    assert "%" in sentence                           # the relative shift
+    assert "fold 0" in sentence and "S=100" in sentence
+    assert "same origins" in sentence
+
+
+def test_one_run_per_precision_refuses_to_declare_anything():
+    """A bare difference with no noise floor is the number that misleads."""
+    rows = _rows([0.003700], [0.003750])
+    verdict = runner._precision_verdicts(rows, repeats=1)
+    assert verdict["within_noise"] is None
+    assert verdict["sentence"] is None
+    assert any("not measured" in line for line in verdict["report"])
+
+
+def test_the_noise_floor_is_the_wider_of_the_two_spreads():
+    """Conservative: a larger floor makes 'within noise' harder to earn."""
+    rows = _rows([0.003700, 0.003701], [0.003700, 0.003760])
+    report = "\n".join(runner._precision_verdicts(rows, repeats=2)["report"])
+    assert "0.000060" in report, report
+
+
+def test_missing_a_precision_produces_no_verdict():
+    rows = _rows([0.0037, 0.0037], [])
+    verdict = runner._precision_verdicts(rows, repeats=2)
+    assert verdict["sentence"] is None
+
+
+def test_autocast_is_off_for_fp32_and_off_on_cpu():
+    """The scope of the numerics change is exactly one call, on CUDA, in fp16."""
+    fp32 = _adapter(100, 64, 512)
+    fp32.precision = "fp32"
+    fp32.torch = types.SimpleNamespace(autocast=lambda *a, **k: "AUTOCAST",
+                                       float16="f16")
+    assert fp32._autocast() != "AUTOCAST"
+
+    on_cpu = _adapter(100, 64, 512)          # device is cpu in the helper
+    on_cpu.precision = "fp16"
+    on_cpu.torch = fp32.torch
+    assert on_cpu._autocast() != "AUTOCAST"
+
+
+def test_fp16_on_cuda_enables_autocast():
+    adapter = runner.KronosAdapter(
+        our_grid=(0.1, 0.5, 0.9), context=512, device="cuda", batch=8,
+        sample_count=100, precision="fp16")
+    captured = {}
+
+    def fake_autocast(device, dtype=None):
+        captured["device"], captured["dtype"] = device, dtype
+        return "AUTOCAST"
+
+    adapter.torch = types.SimpleNamespace(autocast=fake_autocast, float16="f16")
+    assert adapter._autocast() == "AUTOCAST"
+    assert captured == {"device": "cuda", "dtype": "f16"}
+
+
+def test_precision_and_its_verification_are_recorded_in_grid_json():
+    adapter = runner.KronosAdapter(
+        our_grid=(0.01, 0.5, 0.99), context=512, device="cuda", batch=8,
+        sample_count=100, precision="fp16",
+        verification="fp16 verified against fp32 on fold 0")
+    note = adapter.grid_note()
+    assert note["precision"] == "fp16"
+    assert "verified against fp32" in note["precision_verification"]
+    assert "fp64" in note["precision_scope"]
+
+
+def test_an_unverified_fp16_run_says_so_in_grid_json():
+    """Silence would read as verified; the artefact has to state the absence."""
+    adapter = runner.KronosAdapter(
+        our_grid=(0.01, 0.5, 0.99), context=512, device="cuda", batch=8,
+        sample_count=100, precision="fp16", verification=None)
+    note = adapter.grid_note()
+    assert "NOT VERIFIED" in note["precision_verification"]
+
+
 def test_the_proxy_matches_the_chunk_extent_not_the_full_sample_count():
     """The trap introduced by chunking.
 
