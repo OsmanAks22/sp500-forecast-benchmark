@@ -169,6 +169,7 @@ from sp500bench.config import (load_configs, load_data_config,  # noqa: E402
                                quantile_column, quantile_columns)
 from sp500bench.evaluation.splits import (PurgedWalkForward,  # noqa: E402
                                           assert_no_overlap)
+from sp500bench.models.registry import BY_NAME  # noqa: E402
 
 FOUNDATION_MODELS = ["Chronos-2", "TimesFM-2.5", "TTM", "Kronos-small"]
 
@@ -198,7 +199,12 @@ DEFAULT_CONTEXT = 512          # Kronos' documented context_limit; TTM's fixed
                                # context_length. Shared so the four models see
                                # the same history and the comparison is on the
                                # model, not on how much past it was handed.
-DEFAULT_SAMPLE_COUNT = 200
+# 100 paths, on the full test period, rather than more paths on a narrower one.
+# Read from the roster so the runner and the frozen spec cannot drift; the
+# literal is the fallback if the spec ever stops carrying it.
+DEFAULT_SAMPLE_COUNT = BY_NAME["Kronos-small"].params.get("sample_count", 100)
+KRONOS_SAMPLE_RATIONALE = BY_NAME["Kronos-small"].params.get(
+    "sample_count_rationale", "")
 DEFAULT_BATCH = 256
 
 # Kronos' memory model, which is not the same as the other three.
@@ -771,6 +777,21 @@ KRONOS_INFERENCE_PARAMS = (
     "clip", "T", "top_k", "top_p", "sample_count", "verbose")
 
 
+def _wrap_text(text: str, width: int) -> list[str]:
+    if not text:
+        return []
+    words, lines, current = text.split(), [], ""
+    for word in words:
+        if len(current) + len(word) + 1 > width:
+            lines.append(current)
+            current = word
+        else:
+            current = f"{current} {word}".strip()
+    if current:
+        lines.append(current)
+    return lines
+
+
 def _inference_surface(obj) -> list[str]:
     """Public names plus the signature of anything that looks like inference.
 
@@ -942,6 +963,13 @@ class KronosAdapter(Adapter):
         chunks = self.sample_chunks()
         print(f"    sample_count  {self.sample_count} paths/origin  "
               f"features {self.feature_cols}  close at index {self.close_at}")
+        # In the run log, not only in the parquet: the reason a sample count was
+        # chosen and the direction of the bias it carries have to be legible to
+        # whoever reads the run, not reconstructed from a commit later.
+        print(f"    provenance    sample_count={self.sample_count} chosen for "
+              "compute, on the full test period rather than a narrower window")
+        for line in _wrap_text(KRONOS_SAMPLE_RATIONALE, 74):
+            print(f"                  {line}")
         # Printed before the first call, because the product is the number that
         # decides whether this fits in the card and it is not either input.
         print(f"    memory        paths/call {self.paths_per_call} "
@@ -1144,6 +1172,17 @@ class KronosAdapter(Adapter):
             "paths_per_call": self.paths_per_call,
             "sequence_budget": self.sequence_budget,
             "budget_reduced_after_oom": self.budget_was_reduced,
+            # Why this sample count, and which way its error points. Carried in
+            # the artefact so any table built from these forecasts can state it
+            # without the reader having to reconstruct it from the history.
+            "sample_count_chosen_for": "compute",
+            "evaluation_window": "full test period (not the clean slice)",
+            "tail_bias": "inward",
+            "tail_bias_direction": (
+                "penalises this model: finite-sample extreme quantiles are "
+                "estimated narrower than the true predictive tails, so q0.01 "
+                "and q0.99 are too tight and CRPS is inflated"),
+            "sample_count_rationale": KRONOS_SAMPLE_RATIONALE,
             "notes": (
                 f"Empirical order statistics of {self.sample_count} sampled "
                 "close paths, converted to log returns against the last "

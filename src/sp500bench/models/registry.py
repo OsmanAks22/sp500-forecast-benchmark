@@ -126,7 +126,22 @@ REGISTRY: list[ModelSpec] = [
                "tokenizer": "NeoQuasar/Kronos-Tokenizer-base",
                "pretrain_cutoff": "2024-06",
                "context_limit": 512,
-               "us_equities_in_distribution": True}),
+               "us_equities_in_distribution": True,
+               # Chosen for compute, on the full test period, in preference to
+               # a larger sample on a narrower window. The clean slice is 100%
+               # bull, 78% mid_vol and four low-vol sessions, so scoping Kronos
+               # to it would have removed the one foundation model with a
+               # documented cutoff from H3 - the stratification where the
+               # volatility arm already shows a regime-dependent reversal.
+               "sample_count": 100,
+               "sample_count_rationale": (
+                   "Empirical quantiles of 100 sampled paths. Finite-sample "
+                   "extreme quantiles are biased inward, so q0.01 and q0.99 are "
+                   "estimated narrower than the model's true predictive tails "
+                   "and its CRPS is inflated. The bias penalises this model "
+                   "rather than flattering it, and its direction is known and "
+                   "reportable - which a narrowed evaluation window would not "
+                   "have been. Report alongside every Kronos CRPS.")}),
     ModelSpec("TTM", "foundation", "granite-tsfm", "zero_shot", True, False,
               "ADDED. TinyTimeMixers (IBM Granite), a sub-1M-parameter MLP-Mixer TSFM. "
               "Direct replication probe: Brini (2026) reports TTM as the only TSFM to "
