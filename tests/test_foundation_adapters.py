@@ -97,7 +97,7 @@ def test_the_shim_does_not_leak_into_the_numpy_module(monkeypatch):
     real_mean = np.mean
     probe = np.zeros((2, SAMPLE_COUNT, 3, 4))
 
-    with adapter._keep_sample_axis():
+    with adapter._keep_sample_axis(SAMPLE_COUNT):
         # Inside kronos's namespace the proxy is in force ...
         assert adapter.kronos_module.np.mean(probe, axis=1).shape == probe.shape
         # ... and everywhere else numpy is untouched.
@@ -115,7 +115,7 @@ def test_the_binding_is_restored_even_if_the_call_raises():
     adapter.kronos_module = _fake_kronos_module()
 
     with pytest.raises(RuntimeError):
-        with adapter._keep_sample_axis():
+        with adapter._keep_sample_axis(SAMPLE_COUNT):
             raise RuntimeError("decode blew up")
     assert adapter.kronos_module.np is np
 
@@ -168,3 +168,109 @@ def test_positional_only_parameters_are_rejected():
 def test_a_missing_function_says_why_predict_is_not_a_substitute():
     with pytest.raises(SystemExit, match="averages the sample axis"):
         runner._assert_kronos_signature(_fake_kronos_module())
+
+
+# --------------------------------------------------------------------------
+# 3. the memory model: sequences resident are batch x sample_count
+# --------------------------------------------------------------------------
+
+def _adapter(sample_count, paths_per_call, budget):
+    return runner.KronosAdapter(
+        our_grid=(0.1, 0.5, 0.9), context=512, device="cpu", batch=256,
+        sample_count=sample_count, paths_per_call=paths_per_call,
+        sequence_budget=budget)
+
+
+def test_sample_chunks_sum_to_sample_count_and_respect_the_ceiling():
+    for sample_count in (100, 200, 500, 1000):
+        for width in (1, 16, 64, 128):
+            adapter = _adapter(sample_count, width, 512)
+            chunks = adapter.sample_chunks()
+            assert sum(chunks) == sample_count, (sample_count, width, chunks)
+            assert max(chunks) <= adapter.paths_per_call
+            assert all(c > 0 for c in chunks)
+
+
+def test_paths_per_call_never_exceeds_sample_count():
+    """At S=100 a 128-wide chunk would ask for more paths than exist."""
+    adapter = _adapter(100, 128, 512)
+    assert adapter.paths_per_call == 100
+    assert adapter.sample_chunks() == [100]
+
+
+def test_resident_sequences_stay_under_the_budget_at_every_sample_count():
+    """The invariant the OOM violated.
+
+    The old code chunked only the origin dimension, so the product
+    origin_batch * sample_count grew with the sweep. It must now be flat.
+    """
+    for sample_count in (100, 200, 500, 1000):
+        adapter = _adapter(sample_count, 64, 512)
+        resident = adapter.origin_batch * adapter.paths_per_call
+        assert resident <= 512, (sample_count, resident)
+
+
+def test_the_old_sizing_would_have_exceeded_the_card_and_the_new_one_does_not():
+    """Anchored on the configuration that actually OOMed on the T4."""
+    adapter = _adapter(100, 64, 512)
+    old_style_origin_batch = 4096 // 100          # the previous per_call formula
+    old_resident = old_style_origin_batch * 100   # sample dim was not chunked
+    assert old_resident == 4000
+    new_resident = adapter.origin_batch * adapter.paths_per_call
+    assert new_resident <= 512
+    assert new_resident < old_resident / 4
+
+
+def test_origin_batch_shrinks_when_the_budget_is_cut_after_an_oom():
+    """forecast_fold reads origin_batch each iteration, so the cut must show."""
+    adapter = _adapter(500, 64, 512)
+    before = adapter.origin_batch
+    adapter.sequence_budget //= 2
+    assert adapter.origin_batch == before // 2
+    assert adapter.origin_batch >= 1
+
+
+def test_origin_batch_never_falls_below_one():
+    adapter = _adapter(500, 64, 8)      # budget smaller than one chunk
+    assert adapter.origin_batch == 1
+
+
+def test_oom_is_recognised_across_torch_versions():
+    """The except clause cannot name torch.OutOfMemoryError - it may not exist.
+
+    ``_is_oom`` is only the second half of the test: the ``except RuntimeError``
+    clause narrows the type, and this decides whether a RuntimeError that got
+    that far is a memory failure. It is deliberately not a type check, because
+    the class is named differently across torch versions and is absent before
+    2.4 - naming it in an except clause would raise AttributeError at the moment
+    the handler is needed.
+    """
+    class OutOfMemoryError(RuntimeError):        # how torch 2.4+ spells it
+        pass
+
+    assert runner._is_oom(OutOfMemoryError("Tried to allocate 1.95 GiB"))
+    assert runner._is_oom(RuntimeError("CUDA out of memory. Tried to allocate"))
+    assert not runner._is_oom(RuntimeError("shape mismatch"))
+    # Anything that is not a RuntimeError is re-raised by the caller before this
+    # is consulted, so the predicate is never asked about one.
+    assert isinstance(OutOfMemoryError("x"), RuntimeError)
+
+
+def test_the_proxy_matches_the_chunk_extent_not_the_full_sample_count():
+    """The trap introduced by chunking.
+
+    Once the sample dimension is chunked the returned array's sample axis is the
+    chunk width. A proxy still matching on the full sample_count would leave the
+    reduction in place and the sample axis would be silently collapsed.
+    """
+    adapter = _adapter(500, 64, 512)
+    adapter.kronos_module = _fake_kronos_module()
+    chunk = adapter.sample_chunks()[0]
+    assert chunk == 64 and chunk != adapter.sample_count
+
+    block = np.zeros((4, chunk, 1, 6))
+    with adapter._keep_sample_axis(chunk):
+        assert adapter.kronos_module.np.mean(block, axis=1).shape == block.shape
+    # Matching on the full sample_count instead would have reduced it away.
+    with adapter._keep_sample_axis(adapter.sample_count):
+        assert adapter.kronos_module.np.mean(block, axis=1).shape == (4, 1, 6)

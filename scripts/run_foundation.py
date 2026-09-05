@@ -182,7 +182,31 @@ DEFAULT_CONTEXT = 512          # Kronos' documented context_limit; TTM's fixed
                                # model, not on how much past it was handed.
 DEFAULT_SAMPLE_COUNT = 200
 DEFAULT_BATCH = 256
-DEFAULT_KRONOS_PATHS_PER_CALL = 4096   # batch x sample_count sequence cap
+
+# Kronos' memory model, which is not the same as the other three.
+#
+# ``auto_regressive_inference`` expands its input to ``batch * sample_count``
+# along the batch axis (``model/kronos.py:394``) before the tokenizer encodes
+# anything, so the sequences actually resident are the *product*, not the origin
+# batch. At sample_count=100 with an origin batch of 40 that is 4,000 sequences
+# of 512 bars entering rotary attention in one pass, which is what put a T4 into
+# OOM trying to allocate 1.95 GiB against 1.52 GiB free.
+#
+# Two ceilings, because there are two axes to cap:
+#   PATHS_PER_CALL   how many sample paths go in one call. The sample dimension
+#                    is chunked at this width and the chunks are concatenated.
+#   SEQUENCE_BUDGET  the ceiling on origin_batch * paths_per_call, i.e. on the
+#                    sequences resident in a single call. The origin batch is
+#                    derived from it rather than set independently.
+#
+# Chunking the sample dimension changes which draws are realised - the chunks
+# are separate stochastic calls - but not the distribution they are drawn from,
+# so CRPS is unaffected in expectation. It does mean a run is only reproducible
+# at the same --paths-per-call, which is why both settings are recorded in
+# grid.json and in the timings.
+DEFAULT_KRONOS_PATHS_PER_CALL = 64
+DEFAULT_KRONOS_SEQUENCE_BUDGET = 512
+MIN_KRONOS_SEQUENCE_BUDGET = 32
 
 
 def show(path: Path) -> str:
@@ -608,6 +632,19 @@ KRONOS_INFERENCE_PARAMS = (
     "clip", "T", "top_k", "top_p", "sample_count", "verbose")
 
 
+def _is_oom(exc: BaseException) -> bool:
+    """CUDA OOM across torch versions.
+
+    ``torch.OutOfMemoryError`` only exists from 2.4 and is a ``RuntimeError``
+    subclass in every version that has it, so the base class is caught and the
+    identity checked here. Naming the attribute in an ``except`` clause would
+    itself raise ``AttributeError`` on an older image - a failure in the error
+    handler, at the moment the error handler is needed.
+    """
+    return (type(exc).__name__ == "OutOfMemoryError"
+            or "out of memory" in str(exc).lower())
+
+
 def _assert_kronos_signature(kronos_module) -> None:
     """Every parameter this runner names must exist, and accept a keyword.
 
@@ -649,11 +686,50 @@ class KronosAdapter(Adapter):
     needs_bars = True
 
     def __init__(self, our_grid, context, device, batch, sample_count,
-                 paths_per_call=DEFAULT_KRONOS_PATHS_PER_CALL, kronos_path=None):
+                 paths_per_call=DEFAULT_KRONOS_PATHS_PER_CALL, kronos_path=None,
+                 sequence_budget=DEFAULT_KRONOS_SEQUENCE_BUDGET):
         super().__init__(our_grid, context, device, batch)
         self.sample_count = sample_count
-        self.paths_per_call = paths_per_call
+        # Clamped by both: more paths than exist is meaningless, and a chunk
+        # wider than the whole budget would make the printed origin batch a
+        # fiction. The OOM handler applies the same clamp, so a budget set on the
+        # command line and one arrived at by halving behave identically.
+        self.paths_per_call = max(1, min(paths_per_call, sample_count,
+                                         sequence_budget))
+        self.sequence_budget = sequence_budget
         self.kronos_path = kronos_path
+        self.budget_was_reduced = False
+
+    @property
+    def origin_batch(self) -> int:
+        """Origins per call, derived so ``origin_batch * paths_per_call`` fits.
+
+        Read fresh on every batch rather than computed once, so that a budget cut
+        after an OOM takes effect for the rest of the run instead of the same
+        oversized batch being retried repeatedly.
+        """
+        return max(1, self.sequence_budget // self.paths_per_call)
+
+    def sample_chunks(self) -> list[int]:
+        """The sample dimension split into calls of at most ``paths_per_call``."""
+        full, remainder = divmod(self.sample_count, self.paths_per_call)
+        chunks = [self.paths_per_call] * full
+        if remainder:
+            chunks.append(remainder)
+        return chunks
+
+    def _free(self) -> None:
+        if getattr(self, "torch", None) is not None and self.device.startswith("cuda"):
+            self.torch.cuda.empty_cache()
+
+    def reset_peak_memory(self) -> None:
+        if getattr(self, "torch", None) is not None and self.device.startswith("cuda"):
+            self.torch.cuda.reset_peak_memory_stats()
+
+    def peak_memory_gib(self) -> float:
+        if getattr(self, "torch", None) is not None and self.device.startswith("cuda"):
+            return self.torch.cuda.max_memory_allocated() / 1024 ** 3
+        return float("nan")
 
     def load(self) -> None:
         import torch
@@ -671,12 +747,28 @@ class KronosAdapter(Adapter):
         self.feature_cols = (list(self.predictor.price_cols)
                              + [self.predictor.vol_col, self.predictor.amt_vol])
         self.close_at = self.feature_cols.index("close")
+        chunks = self.sample_chunks()
         print(f"    sample_count  {self.sample_count} paths/origin  "
               f"features {self.feature_cols}  close at index {self.close_at}")
+        # Printed before the first call, because the product is the number that
+        # decides whether this fits in the card and it is not either input.
+        print(f"    memory        paths/call {self.paths_per_call} "
+              f"x origin batch {self.origin_batch} = "
+              f"{self.origin_batch * self.paths_per_call} sequences of "
+              f"{self.context} bars per call "
+              f"(budget {self.sequence_budget})")
+        print(f"    sample chunks {len(chunks)} per origin batch: {chunks}")
 
     @contextlib.contextmanager
-    def _keep_sample_axis(self):
+    def _keep_sample_axis(self, sample_extent: int):
         """Suppress the one reduction that destroys the predictive distribution.
+
+        ``sample_extent`` is the sample count of *this call*, which is the chunk
+        width and not ``self.sample_count`` once the sample dimension is chunked.
+        Matching on the wrong extent would leave the reduction in place, the
+        returned array would come back with the sample axis gone, and the shape
+        assertion in ``predict_bars`` would stop the run - loudly, but for a
+        reason that reads as an upstream change rather than as this arithmetic.
 
         ``auto_regressive_inference`` ends with ``np.mean(preds, axis=1)`` over
         the sample axis (``model/kronos.py:467``), and every public entry point
@@ -694,7 +786,7 @@ class KronosAdapter(Adapter):
         still carries the sample axis at the expected extent.
         """
         real_numpy = self.kronos_module.np
-        self.kronos_module.np = _NumpyProxy(real_numpy, self.sample_count)
+        self.kronos_module.np = _NumpyProxy(real_numpy, sample_extent)
         try:
             yield
         finally:
@@ -710,48 +802,115 @@ class KronosAdapter(Adapter):
         so nothing outside the window enters) and its denormalisation, but keeps
         the sample axis in between.
         """
+        try:
+            return self._predict_bars(windows, x_stamps, y_stamps, last_close)
+        except RuntimeError as exc:
+            if not _is_oom(exc):
+                raise
+            # Measured, not guessed: halve the budget, say so, and try once more.
+            # The reduced budget persists, so the rest of the run uses the size
+            # that actually fit rather than rediscovering this every batch.
+            self._free()
+            before = self.sequence_budget
+            self.sequence_budget = max(MIN_KRONOS_SEQUENCE_BUDGET, before // 2)
+            self.paths_per_call = max(1, min(self.paths_per_call,
+                                             self.sequence_budget))
+            self.budget_was_reduced = True
+            print(f"      OOM at {before} sequences/call "
+                  f"({len(windows)} origins x {self.paths_per_call} paths). "
+                  f"Retrying at budget {self.sequence_budget} "
+                  f"-> {self.origin_batch} x {self.paths_per_call} = "
+                  f"{self.origin_batch * self.paths_per_call}.")
+            if self.sequence_budget >= before:
+                raise SystemExit(
+                    f"Kronos ran out of memory at the floor budget "
+                    f"{MIN_KRONOS_SEQUENCE_BUDGET} and cannot be reduced "
+                    f"further.\n  {exc}") from exc
+
+            step = max(1, self.origin_batch)
+            parts = []
+            for start in range(0, len(windows), step):
+                stop = start + step
+                part, _ = self._predict_bars(
+                    windows[start:stop], x_stamps[start:stop],
+                    y_stamps[start:stop], last_close[start:stop])
+                parts.append(part)
+                self._free()
+            print(f"      retry succeeded at "
+                  f"{self.origin_batch * self.paths_per_call} sequences/call")
+            return np.concatenate(parts, axis=0), {}
+
+    def _predict_bars(self, windows: np.ndarray, x_stamps: np.ndarray,
+                      y_stamps: np.ndarray, last_close: np.ndarray,
+                      ) -> tuple[np.ndarray, dict]:
+        """One origin batch, with the sample dimension chunked.
+
+        The sample axis is the one that multiplies memory, so it is walked in
+        ``paths_per_call``-wide chunks and the resulting close paths are
+        concatenated. Each chunk is an independent stochastic call - nothing is
+        reseeded between them - so the union is a valid draw of ``sample_count``
+        paths from the same predictive distribution as a single call would have
+        given, just not the same realisation.
+        """
         n = len(windows)
         mean = windows.mean(axis=1, keepdims=True)
         std = windows.std(axis=1, keepdims=True)
         norm = np.clip((windows - mean) / (std + 1e-5), -self.predictor.clip,
                        self.predictor.clip)
 
-        x = self.torch.tensor(norm, dtype=self.torch.float32)
-        xs = self.torch.tensor(x_stamps, dtype=self.torch.float32)
-        ys = self.torch.tensor(y_stamps, dtype=self.torch.float32)
+        x = self.torch.tensor(norm, dtype=self.torch.float32).to(self.device)
+        xs = self.torch.tensor(x_stamps, dtype=self.torch.float32).to(self.device)
+        ys = self.torch.tensor(y_stamps, dtype=self.torch.float32).to(self.device)
 
-        # Every argument by name. Positionally, an upstream insertion or reorder
-        # would pass temperature where top_k belongs and return samples that look
-        # entirely reasonable; by keyword the same change raises.
-        with self._keep_sample_axis():
-            with self.torch.no_grad():
-                paths = self.kronos_module.auto_regressive_inference(
-                    tokenizer=self.predictor.tokenizer,
-                    model=self.predictor.model,
-                    x=x.to(self.device),
-                    x_stamp=xs.to(self.device),
-                    y_stamp=ys.to(self.device),
-                    max_context=self.context,
-                    pred_len=1,
-                    clip=self.predictor.clip,
-                    T=1.0,
-                    top_k=0,
-                    top_p=0.9,
-                    sample_count=self.sample_count,
-                    verbose=False,
-                )
+        collected = []
+        try:
+            for chunk in self.sample_chunks():
+                # Every argument by name. Positionally, an upstream insertion or
+                # reorder would pass temperature where top_k belongs and return
+                # samples that look entirely reasonable; by keyword it raises.
+                # The proxy matches on `chunk`, not self.sample_count.
+                with self._keep_sample_axis(chunk):
+                    with self.torch.no_grad():
+                        paths = self.kronos_module.auto_regressive_inference(
+                            tokenizer=self.predictor.tokenizer,
+                            model=self.predictor.model,
+                            x=x,
+                            x_stamp=xs,
+                            y_stamp=ys,
+                            max_context=self.context,
+                            pred_len=1,
+                            clip=self.predictor.clip,
+                            T=1.0,
+                            top_k=0,
+                            top_p=0.9,
+                            sample_count=chunk,
+                            verbose=False,
+                        )
 
-        paths = np.asarray(paths)
-        if paths.ndim != 4 or paths.shape[0] != n or paths.shape[1] != self.sample_count:
+                paths = np.asarray(paths)
+                if paths.ndim != 4 or paths.shape[0] != n or paths.shape[1] != chunk:
+                    raise AssertionError(
+                        f"Kronos returned {paths.shape}; expected "
+                        f"({n}, {chunk}, steps, features). The sample axis was "
+                        "collapsed - _keep_sample_axis did not take effect, and "
+                        "the quantiles would be copies of a mean path.")
+
+                # Reduce to the one column that is needed before anything else is
+                # kept, so the full (n, chunk, steps, features) block can go.
+                step = paths[:, :, -1, :]
+                step = step * (std[:, 0, :][:, None, :] + 1e-5) \
+                    + mean[:, 0, :][:, None, :]
+                collected.append(step[:, :, self.close_at])
+                del paths, step
+        finally:
+            del x, xs, ys
+
+        close_paths = np.concatenate(collected, axis=1)          # (n, sample_count)
+        if close_paths.shape != (n, self.sample_count):
             raise AssertionError(
-                f"Kronos returned {paths.shape}; expected "
-                f"({n}, {self.sample_count}, steps, features). The sample axis "
-                "was collapsed - _keep_sample_axis did not take effect, and the "
-                "quantiles would be nine copies of a mean path.")
-
-        step = paths[:, :, -1, :]                              # last predicted step
-        step = step * (std[:, 0, :][:, None, :] + 1e-5) + mean[:, 0, :][:, None, :]
-        close_paths = step[:, :, self.close_at]                 # (n, sample_count)
+                f"assembled {close_paths.shape} close paths, expected "
+                f"({n}, {self.sample_count}) - the sample chunks did not sum to "
+                "sample_count")
         returns = np.log(close_paths / last_close[:, None])
         levels = np.quantile(returns, self.our_grid, axis=1).T   # (n, len(our_grid))
         return levels, {}
@@ -761,6 +920,13 @@ class KronosAdapter(Adapter):
             "model": self.name, "scored_on_frozen_grid": True,
             "native_levels": list(self.our_grid),
             "sample_count": self.sample_count,
+            # Recorded because the sample dimension is chunked at this width and
+            # each chunk is a separate stochastic call: the distribution is the
+            # same at any setting, the realised draws are not, so a bit-for-bit
+            # rerun needs the same value.
+            "paths_per_call": self.paths_per_call,
+            "sequence_budget": self.sequence_budget,
+            "budget_reduced_after_oom": self.budget_was_reduced,
             "notes": (
                 f"Empirical order statistics of {self.sample_count} sampled "
                 "close paths, converted to log returns against the last "
@@ -787,7 +953,7 @@ def make_adapter(name: str, our_grid, args) -> Adapter:
     if name == "Kronos-small":
         return KronosAdapter(our_grid, args.context, args.device, args.batch_size,
                              args.sample_count, args.kronos_paths_per_call,
-                             args.kronos_path)
+                             args.kronos_path, args.kronos_sequence_budget)
     raise SystemExit(f"{name} is not a foundation model in this runner")
 
 
@@ -840,9 +1006,11 @@ def forecast_fold(adapter: Adapter, bars: pd.DataFrame, split, our_grid,
             stamps = adapter.kronos_module.calc_time_stamps(
                 pd.Series(dates)).to_numpy(dtype=np.float32)
 
-            per_call = max(1, adapter.paths_per_call // adapter.sample_count)
-            for start in range(0, usable.size, per_call):
-                chunk = usable[start:start + per_call]
+            # adapter.origin_batch is read fresh each iteration: if a call OOMs
+            # and halves the budget, the remaining batches use the size that fit.
+            start = 0
+            while start < usable.size:
+                chunk = usable[start:start + adapter.origin_batch]
                 windows = np.stack([feats[o - adapter.context + 1:o + 1] for o in chunk])
                 x_stamps = np.stack([stamps[o - adapter.context + 1:o + 1] for o in chunk])
                 # The stamp of the session being forecast, o + 1. Origins are
@@ -858,6 +1026,11 @@ def forecast_fold(adapter: Adapter, bars: pd.DataFrame, split, our_grid,
                     out.loc[start:start + len(chunk) - 1, quantile_column(q)] = levels[:, j]
                 for k, v in extras.items():
                     extras_acc.setdefault(k, []).append(v)
+                start += len(chunk)
+                # Kronos holds the largest transient of the four; releasing the
+                # caching allocator between batches keeps a later, slightly
+                # larger allocation from failing against a fragmented pool.
+                adapter._free()
         else:
             contexts = build_context_matrix(closes, usable, adapter.context,
                                             adapter.series)
@@ -929,6 +1102,11 @@ def run_model(adapter: Adapter, bars: pd.DataFrame, walk_forward: PurgedWalkForw
             "n_forecasts": rows_written, "n_folds": len(fold_times),
             "context": adapter.context, "device": args.device,
             "sample_count": getattr(adapter, "sample_count", None),
+            "paths_per_call": getattr(adapter, "paths_per_call", None),
+            "sequence_budget": getattr(adapter, "sequence_budget", None),
+            "budget_reduced_after_oom": getattr(adapter, "budget_was_reduced", None),
+            "peak_gpu_gib": (adapter.peak_memory_gib()
+                             if hasattr(adapter, "peak_memory_gib") else None),
             "partial": True,
             "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         })
@@ -947,6 +1125,11 @@ def run_model(adapter: Adapter, bars: pd.DataFrame, walk_forward: PurgedWalkForw
         "n_forecasts": rows_written, "n_folds": len(fold_times),
         "context": adapter.context, "device": args.device,
         "sample_count": getattr(adapter, "sample_count", None),
+        "paths_per_call": getattr(adapter, "paths_per_call", None),
+        "sequence_budget": getattr(adapter, "sequence_budget", None),
+        "budget_reduced_after_oom": getattr(adapter, "budget_was_reduced", None),
+        "peak_gpu_gib": (adapter.peak_memory_gib()
+                         if hasattr(adapter, "peak_memory_gib") else None),
         "partial": False,
         "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     })
@@ -987,11 +1170,13 @@ def calibrate(bars: pd.DataFrame, feats: pd.DataFrame, walk_forward, our_grid,
     for s in args.calib_sample_counts:
         adapter = KronosAdapter(our_grid, args.context, args.device,
                                 args.batch_size, s, args.kronos_paths_per_call,
-                                args.kronos_path)
+                                args.kronos_path, args.kronos_sequence_budget)
         adapter.load()
+        adapter.reset_peak_memory()
         t0 = time.perf_counter()
         forecasts = forecast_fold(adapter, bars, split, our_grid, tickers)
         elapsed = time.perf_counter() - t0
+        peak_gib = adapter.peak_memory_gib()
 
         merged = forecasts.merge(
             truth.rename("y"), left_on=["unique_id", "ds"],
@@ -1001,21 +1186,35 @@ def calibrate(bars: pd.DataFrame, feats: pd.DataFrame, walk_forward, our_grid,
         crps = crps_from_quantiles(usable["y"].to_numpy(dtype=float), qf)
 
         per_origin = elapsed / max(1, len(usable))
-        full_hours = per_origin * 50 * 1670 / 3600
-        rows.append((s, crps, elapsed, len(usable), per_origin, full_hours))
+        full_hours = per_origin * 50 * 1669 / 3600
+        seqs = adapter.origin_batch * adapter.paths_per_call
+        rows.append((s, crps, elapsed, len(usable), per_origin, full_hours,
+                     peak_gib, seqs, adapter.budget_was_reduced))
         print(f"  S={s:<5} CRPS {crps:.6f}  {elapsed:8.1f}s over {len(usable):,} "
               f"origins  ({per_origin * 1000:.1f} ms/origin -> "
-              f"{full_hours:.1f} GPU-h for the full 83,500)")
+              f"{full_hours:.1f} GPU-h for the full 83,450)  "
+              f"peak {peak_gib:.2f} GiB @ {seqs} seq/call"
+              f"{'  [budget reduced after OOM]' if adapter.budget_was_reduced else ''}")
+        del adapter
 
-    print(f"\n{'S':>6}{'CRPS':>12}{'d vs prev':>12}{'ms/origin':>12}{'full-run GPU-h':>16}")
+    print(f"\n{'S':>6}{'CRPS':>12}{'d vs prev':>12}{'ms/origin':>12}"
+          f"{'peak GiB':>10}{'seq/call':>10}{'full-run GPU-h':>16}")
     prev = None
-    for s, crps, _, _, per_origin, full_hours in rows:
+    for s, crps, _, _, per_origin, full_hours, peak_gib, seqs, reduced in rows:
         delta = "" if prev is None else f"{(crps - prev) / prev * 100:+.3f}%"
-        print(f"{s:>6}{crps:>12.6f}{delta:>12}{per_origin * 1000:>12.1f}{full_hours:>16.1f}")
+        flag = " *" if reduced else ""
+        print(f"{s:>6}{crps:>12.6f}{delta:>12}{per_origin * 1000:>12.1f}"
+              f"{peak_gib:>10.2f}{seqs:>10}{full_hours:>16.1f}{flag}")
         prev = crps
     print("\nRead it as: if CRPS has stopped moving between the two largest S, "
           "the smaller one is adequate and the difference is sampling noise, "
           "not model uncertainty. The GPU-h column is measured, not assumed.")
+    print("peak GiB is torch.cuda.max_memory_allocated over the whole sweep step, "
+          "so it is the\nceiling the full run has to live under, at the "
+          "seq/call the row actually used.")
+    if any(r[-1] for r in rows):
+        print("* this row hit OOM and finished at a reduced budget; seq/call is "
+              "the size that worked.")
 
     out = Path(args.calib_out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1025,9 +1224,13 @@ def calibrate(bars: pd.DataFrame, feats: pd.DataFrame, walk_forward, our_grid,
         "tickers": tickers,
         "context": args.context,
         "device": args.device,
+        "paths_per_call": args.kronos_paths_per_call,
+        "sequence_budget": args.kronos_sequence_budget,
         "rows": [{"sample_count": s, "crps": c, "seconds": e, "n_origins": n,
-                  "seconds_per_origin": p, "projected_full_run_gpu_hours": h}
-                 for s, c, e, n, p, h in rows],
+                  "seconds_per_origin": p, "projected_full_run_gpu_hours": h,
+                  "peak_gpu_gib": g, "sequences_per_call": q,
+                  "budget_reduced_after_oom": r}
+                 for s, c, e, n, p, h, g, q, r in rows],
         "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }, indent=2) + "\n")
     print(f"-> {show(out)}")
@@ -1115,7 +1318,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=DEFAULT_BATCH)
     p.add_argument("--kronos-paths-per-call", type=int,
                    default=DEFAULT_KRONOS_PATHS_PER_CALL,
-                   help="cap on batch x sample_count sequences in one call")
+                   help="sample paths per call; the sample dimension is chunked "
+                        f"at this width (default {DEFAULT_KRONOS_PATHS_PER_CALL})")
+    p.add_argument("--kronos-sequence-budget", type=int,
+                   default=DEFAULT_KRONOS_SEQUENCE_BUDGET,
+                   help="ceiling on origin_batch x paths_per_call, i.e. the "
+                        "sequences resident in one call; the origin batch is "
+                        f"derived from it (default {DEFAULT_KRONOS_SEQUENCE_BUDGET})")
     p.add_argument("--kronos-path", default="Kronos",
                    help="clone of github.com/shiyu-coder/Kronos")
     p.add_argument("--input-series", choices=["return", "price"], default="return",
