@@ -25,6 +25,33 @@ pooled test period. Cells with no sessions are written out with ``n_obs = 0``
 rather than omitted - an empty cell is a fact about the design (H4's clean slice
 has no bear days at all), and a missing row is easy to mistake for an oversight.
 
+Models that cannot reach the whole grid
+---------------------------------------
+CRPS here is the pinball average over a grid of levels, so it is only comparable
+between two models when both were scored on the *same* grid. Most of the roster
+emits the frozen nine and the question does not arise. Two of the foundation
+checkpoints cannot:
+
+* **TimesFM-2.5** has a fixed nine-decile head, ``[0.1 .. 0.9]``, and the level
+  set is not settable. Four frozen levels - 0.01, 0.05, 0.95, 0.99 - lie outside
+  it. Its CRPS is computed over its own nine levels and every table marks it, so
+  the number is never read against a model scored on the frozen nine.
+* **TTM** has no quantile head at all and is absent from CRPS, PICP and interval
+  score entirely.
+
+Each model's reachable levels come from ``forecasts/{model}/grid.json``, written
+by ``run_foundation.py``. A model with no such file is scored on the frozen grid,
+which is what every existing tier does.
+
+The absences are *asserted*, not inferred from arithmetic. An all-NaN column does
+propagate NaN through ``crps_from_quantiles`` and would produce the right answer
+on its own - but a *partially* NaN column does not: ``pinball_loss`` drops
+non-finite pairs, so a model that failed on some origins would get a CRPS
+averaged over a different set of observations at each level, silently and with
+nothing raised. ``assert_grid_matches_data`` therefore checks that every level a
+model declares reachable is finite everywhere and every level it declares
+unreachable is NaN everywhere, and fails the run otherwise.
+
 Usage
 -----
     python scripts/evaluate.py
@@ -34,7 +61,9 @@ Usage
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -44,7 +73,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-from sp500bench.config import ConfigError, load_configs, load_data_config  # noqa: E402
+from sp500bench.config import (ConfigError, load_configs,  # noqa: E402
+                               load_data_config, quantile_column)
 from sp500bench.evaluation.metrics import (crps_from_quantiles,  # noqa: E402
                                            directional_accuracy,
                                            directional_accuracy_with_ci, mae,
@@ -59,6 +89,148 @@ from sp500bench.models.volatility_arm import build_volatility_panel  # noqa: E40
 MIN_DAYS_FOR_CI = 10
 
 STRATIFICATIONS = {"volatility": "vol_regime", "direction": "direction_regime"}
+
+# The two levels PICP80 and the interval score are read off. A model that cannot
+# reach both is absent from those columns for the same reason it is absent from
+# CRPS.
+BAND_LEVELS = (0.1, 0.9)
+
+
+@dataclass(frozen=True)
+class CrpsGrid:
+    """The levels one model's CRPS is averaged over, and whether that is comparable.
+
+    ``levels`` empty means the model emits no quantiles at all and is absent from
+    every probabilistic column. ``comparable`` is false whenever ``levels`` is not
+    the frozen grid, because a pinball average over a different set of levels is a
+    different quantity and must never be ranked against one that is not.
+    """
+
+    label: str
+    levels: tuple[float, ...]
+    comparable: bool
+    note: str = ""
+    # Frozen levels the model *cannot* emit, which must therefore be NaN in the
+    # file. Distinct from "not in ``levels``": a level can be absent from the
+    # CRPS grid and still be legitimately present in the forecasts. TimesFM's
+    # q0.25 and q0.75 are interpolated *inside* its [0.1, 0.9] support, so they
+    # are real numbers and are written; only the four levels outside that
+    # support are unavailable. Collapsing the two would either reject valid
+    # interpolation or accept invented tails.
+    unavailable: tuple[float, ...] = ()
+
+    @property
+    def columns(self) -> list[str]:
+        return [quantile_column(q) for q in self.levels]
+
+    @property
+    def unavailable_columns(self) -> list[str]:
+        return [quantile_column(q) for q in self.unavailable]
+
+    @property
+    def has_band(self) -> bool:
+        return all(any(np.isclose(q, level, atol=1e-12) for level in self.levels)
+                   for q in BAND_LEVELS)
+
+
+def load_crps_grid(root: Path, model: str, cfg) -> CrpsGrid:
+    """The model's reachable levels, from its own ``grid.json`` where it has one.
+
+    Absent - which is every tier written by ``run_experiment.py`` - means the
+    model emits the frozen grid, which is the whole point of the frozen grid.
+    """
+    frozen = tuple(cfg.quantiles)
+    path = root / model / "grid.json"
+    if not path.exists():
+        return CrpsGrid(f"frozen-{len(frozen)}", frozen, True)
+
+    try:
+        spec = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"{path} is not valid JSON: {exc}")
+
+    if spec.get("scored_on_frozen_grid", True):
+        return CrpsGrid(f"frozen-{len(frozen)}", frozen, True, spec.get("notes", ""))
+
+    note = spec.get("notes", "")
+    levels = tuple(float(q) for q in spec.get("native_levels", []))
+    if not levels:
+        # No quantile head: every level but the point forecast must be empty.
+        unavailable = tuple(q for q in frozen if q != 0.5)
+        return CrpsGrid("none", (), False, note, unavailable)
+
+    declared = spec.get("frozen_levels_unavailable")
+    if declared is None:
+        # Older or hand-written grid.json: anything outside the native support
+        # could only have been reached by extrapolation, so it must be absent.
+        low, high = min(levels), max(levels)
+        declared = [q for q in frozen if q < low or q > high]
+    label = f"{model.lower().split('-')[0]}-{len(levels)}"
+    return CrpsGrid(label, levels, False, note,
+                    tuple(float(q) for q in declared))
+
+
+def assert_grid_matches_data(model: str, scored: pd.DataFrame, grid: CrpsGrid,
+                             cfg) -> None:
+    """The declared grid must be what is actually in the file.
+
+    Two directions, both of which have silently wrong answers if unchecked.
+
+    A level declared *reachable* must be finite on every row. ``pinball_loss``
+    drops non-finite pairs, so a column that is NaN on some origins - a failed
+    batch, a truncated context - yields a pinball average over a different set of
+    observations than its neighbours, and the CRPS built from it is a mixture of
+    sample sizes rather than a score. Nothing raises on its own; this does.
+
+    A level declared *unavailable* must be NaN on every row. If a model that is
+    supposed to be absent from CRPS ever starts emitting a band, the absence stops
+    being a property of the model and becomes a bug in this file, and it should
+    fail loudly rather than quietly produce a number.
+
+    A level that is neither - present in the file but not part of this model's
+    CRPS grid, which is what TimesFM's interpolated q0.25 and q0.75 are - is held
+    only to the all-or-nothing rule, because ``build_losses`` still writes a
+    pinball row for it.
+    """
+    n_rows = len(scored)
+    reachable = set(grid.columns)
+    unavailable = set(grid.unavailable_columns)
+    present = [c for c in cfg.quantile_columns if c in scored.columns]
+
+    for column in grid.columns:
+        if column not in scored.columns:
+            raise SystemExit(
+                f"{model}: grid.json declares {column} reachable but the column "
+                f"is not in the forecasts")
+        n_missing = int((~np.isfinite(scored[column].to_numpy(dtype=float))).sum())
+        if n_missing:
+            raise SystemExit(
+                f"{model}: {column} is declared reachable but is NaN on "
+                f"{n_missing:,} of {n_rows:,} rows. pinball_loss drops "
+                "non-finite pairs, so this would produce a CRPS averaged over a "
+                "different observation set at each level rather than an error.")
+
+    for column in present:
+        if column not in unavailable:
+            continue
+        finite = int(np.isfinite(scored[column].to_numpy(dtype=float)).sum())
+        if finite:
+            raise SystemExit(
+                f"{model}: {column} is declared unavailable (grid '{grid.label}') "
+                f"but is finite on {finite:,} rows. Either the checkpoint now "
+                "emits this level and grid.json is stale, or the runner "
+                "extrapolated a level it should have left empty.")
+
+    for column in present:
+        if column in reachable or column in unavailable:
+            continue
+        finite = int(np.isfinite(scored[column].to_numpy(dtype=float)).sum())
+        if finite not in (0, n_rows):
+            raise SystemExit(
+                f"{model}: {column} is neither in the CRPS grid nor declared "
+                f"unavailable, and is finite on {finite:,} of {n_rows:,} rows. "
+                "A level must be present everywhere or nowhere; a partial column "
+                "produces a pinball loss over a shifting observation set.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -144,8 +316,12 @@ def scale_denominators(panel: pd.DataFrame, walk_forward: PurgedWalkForward,
 
 
 def cell_metrics(cell: pd.DataFrame, cfg, denominators, n_boot: int,
-                 arm: str = "return") -> dict:
-    """Every metric named in configs/eval.yaml, for one cell."""
+                 arm: str = "return", grid: CrpsGrid | None = None) -> dict:
+    """Every metric named in configs/eval.yaml, for one cell.
+
+    ``grid`` names the levels this model's CRPS is averaged over. It defaults to
+    the frozen grid, which is what every model that emits it gets.
+    """
     empty = {k: float("nan") for k in
              ("rmse", "mae", "mase", "scaled_error_mad",
               "directional_accuracy", "da_ci_low", "da_ci_high",
@@ -189,9 +365,26 @@ def cell_metrics(cell: pd.DataFrame, cfg, denominators, n_boot: int,
         # estimate stands and the interval columns stay null.
         da = {"estimate": directional_accuracy(y, point)}
 
-    quantile_forecasts = {q: cell[c].to_numpy(dtype=float)
-                          for q, c in zip(cfg.quantiles, cfg.quantile_columns)}
-    lower, upper = cell["q0.1"].to_numpy(), cell["q0.9"].to_numpy()
+    # CRPS over this model's own reachable levels, and only if it has any. A
+    # model with no quantile head is absent from the probabilistic columns by
+    # decision, written NaN here rather than left to NaN arithmetic further down.
+    if grid is None:
+        grid = CrpsGrid(f"frozen-{len(cfg.quantiles)}", tuple(cfg.quantiles), True)
+    if grid.levels:
+        quantile_forecasts = {q: cell[c].to_numpy(dtype=float)
+                              for q, c in zip(grid.levels, grid.columns)}
+        crps_value = crps_from_quantiles(y, quantile_forecasts)
+    else:
+        crps_value = float("nan")
+
+    if grid.has_band:
+        lower = cell[quantile_column(BAND_LEVELS[0])].to_numpy()
+        upper = cell[quantile_column(BAND_LEVELS[1])].to_numpy()
+        picp_value = picp(y, lower, upper)
+        interval_value = mean_interval_score(y, lower, upper, alpha=0.2)
+    else:
+        picp_value = float("nan")
+        interval_value = float("nan")
 
     return {
         "n_obs": len(cell),
@@ -211,9 +404,9 @@ def cell_metrics(cell: pd.DataFrame, cfg, denominators, n_boot: int,
         "da_variance_inflation": da.get("variance_inflation", float("nan")),
         "da_min_detectable_effect": da.get("min_detectable_effect", float("nan")),
         "da_n_obs": da.get("n_obs", float("nan")),
-        "crps": crps_from_quantiles(y, quantile_forecasts),
-        "picp_80": picp(y, lower, upper),
-        "mean_interval_score_80": mean_interval_score(y, lower, upper, alpha=0.2),
+        "crps": crps_value,
+        "picp_80": picp_value,
+        "mean_interval_score_80": interval_value,
     }
 
 
@@ -261,7 +454,7 @@ def build_losses(model: str, scored: pd.DataFrame, cfg) -> pd.DataFrame:
 
 
 def build_rows(model: str, scored: pd.DataFrame, cfg, denominators, folds,
-               n_boot: int) -> list[dict]:
+               n_boot: int, grid: CrpsGrid) -> list[dict]:
     arm = arm_of(model)
     rows = []
     scopes = [(None, scored)] + [(f, scored[scored["fold"] == f]) for f in folds]
@@ -278,7 +471,11 @@ def build_rows(model: str, scored: pd.DataFrame, cfg, denominators, folds,
                 "fold": pd.NA if fold is None else int(fold),
                 "regime_kind": kind,
                 "regime": label,
-                **cell_metrics(cell, cfg, denominators, n_boot, arm),
+                # Carried per row so a consumer reading metrics.parquet alone
+                # cannot pool a partial-grid CRPS with a frozen-grid one.
+                "crps_grid": grid.label,
+                "crps_comparable": grid.comparable,
+                **cell_metrics(cell, cfg, denominators, n_boot, arm, grid),
             })
     return rows
 
@@ -296,7 +493,72 @@ def _ordered(frame: pd.DataFrame) -> pd.DataFrame:
     return frame.sort_values(["_order", "model"]).drop(columns="_order")
 
 
-def print_volatility_arm(table: pd.DataFrame, reference: str = "Log-HAR") -> None:
+def _show(path: Path) -> str:
+    """Repo-relative where possible. ``relative_to`` raises on a path outside the
+    repo or on a relative one, which crashed the run *after* both files had been
+    written - the work was done and the summary line killed it."""
+    try:
+        return str(path.resolve().relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _display_name(model: str, grids: dict[str, CrpsGrid]) -> str:
+    """A model scored on a partial grid carries a mark everywhere it is printed.
+
+    The mark is on the *model*, not on the CRPS cell, because the reason it is
+    not comparable is a property of the checkpoint rather than of one number.
+    """
+    grid = grids.get(model)
+    return f"{model} *" if grid is not None and not grid.comparable else model
+
+
+def print_grid_notes(grids: dict[str, CrpsGrid], cfg) -> None:
+    """Why each marked model is not directly comparable on CRPS.
+
+    The reasoning is carried verbatim from the model's own ``grid.json`` rather
+    than restated here, so the write-up, the table footnote and the runner that
+    produced the forecasts cannot drift into three different explanations.
+    """
+    marked = {m: g for m, g in grids.items() if not g.comparable}
+    if not marked:
+        return
+
+    print("\n" + "=" * 92)
+    print("* NOT DIRECTLY COMPARABLE ON CRPS")
+    print("=" * 92)
+    print(f"CRPS is a pinball average over a grid, so it is comparable only "
+          f"between models scored\non the same levels. Unmarked models use the "
+          f"frozen grid: {list(cfg.quantiles)}.\n")
+    for model, grid in sorted(marked.items()):
+        levels = list(grid.levels) if grid.levels else "none - no quantile head"
+        print(f"  {model}")
+        print(f"    grid   {grid.label}: {levels}")
+        if not grid.levels:
+            print("    CRPS, PICP80 and the interval score are absent for this model -")
+            print("    not zero, and not imputed.")
+        for line in _wrap(grid.note, width=84):
+            print(f"    {line}")
+        print()
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    if not text:
+        return []
+    words, lines, current = text.split(), [], ""
+    for word in words:
+        if len(current) + len(word) + 1 > width:
+            lines.append(current)
+            current = word
+        else:
+            current = f"{current} {word}".strip()
+    if current:
+        lines.append(current)
+    return lines
+
+
+def print_volatility_arm(table: pd.DataFrame, grids: dict[str, CrpsGrid],
+                         reference: str = "Log-HAR") -> None:
     """The volatility arm, read against Log-HAR.
 
     Log-HAR is the reference because it is the benchmark the literature says
@@ -327,7 +589,8 @@ def print_volatility_arm(table: pd.DataFrame, reference: str = "Log-HAR") -> Non
         ref_crps = float(ref["crps"].iloc[0]) if len(ref) else float("nan")
         for _, r in block.sort_values("model").iterrows():
             marker = "  <- ref" if r["model"] == reference else ""
-            print(f"{label:<26}{r['model']:<12}{r['n_obs']:>8,}{r['mase']:>8.3f}"
+            print(f"{label:<26}{_display_name(r['model'], grids):<12}"
+                  f"{r['n_obs']:>8,}{r['mase']:>8.3f}"
                   f"{r['rmse']:>10.5f}{r['rmse'] / ref_rmse:>8.2f}"
                   f"{r['crps']:>10.5f}{r['crps'] / ref_crps:>8.2f}"
                   f"{r['picp_80'] * 100:>8.1f}%{marker}")
@@ -342,7 +605,7 @@ def print_volatility_arm(table: pd.DataFrame, reference: str = "Log-HAR") -> Non
     print("each test window rather than 6.")
 
 
-def print_comparison(table: pd.DataFrame) -> None:
+def print_comparison(table: pd.DataFrame, grids: dict[str, CrpsGrid]) -> None:
     table = table[table.arm == "return"]
     if table.empty:
         return
@@ -360,11 +623,15 @@ def print_comparison(table: pd.DataFrame) -> None:
         label = _window_label(r)
         if label != previous and previous is not object():
             print()
-        print(f"{(label if label != previous else ''):<26}{r['model']:<22}"
+        print(f"{(label if label != previous else ''):<26}"
+              f"{_display_name(r['model'], grids):<22}"
               f"{r['n_obs']:>8,}{r['mase']:>8.3f}{r['directional_accuracy'] * 100:>7.2f}%"
               f"{r['rmse']:>9.5f}{r['crps']:>10.5f}{r['picp_80'] * 100:>7.1f}%")
         previous = label
     print("\nPICP80 is the share of outcomes inside the q0.1-q0.9 band; 80% is nominal.")
+    print("* marks a model not scored on the frozen grid; its CRPS is not directly")
+    print("  comparable to the unmarked rows. See the footnote below. nan means the")
+    print("  model emits no quantiles and is absent from the column.")
 
     print("\n" + "=" * 92)
     print("DIRECTIONAL ACCURACY - date-clustered moving-block bootstrap")
@@ -402,10 +669,12 @@ def print_comparison(table: pd.DataFrame) -> None:
         da = ("    n/a" if not np.isfinite(r["directional_accuracy"])
               else f"{r['directional_accuracy'] * 100:6.2f}%")
         print(f"{(r['regime_kind'] if key != previous else ''):<12}"
-              f"{(r['regime'] if key != previous else ''):<13}{r['model']:<22}"
+              f"{(r['regime'] if key != previous else ''):<13}"
+              f"{_display_name(r['model'], grids):<22}"
               f"{r['n_obs']:>8,}{r['n_days']:>7,}{r['mase']:>8.3f}{da:>8}"
               f"{r['rmse']:>9.5f}{r['crps']:>10.5f}")
         previous = key
+    print("\n* not scored on the frozen grid; CRPS not directly comparable.")
 
 
 def main() -> None:
@@ -454,7 +723,7 @@ def main() -> None:
     print(f"quantile grid: {list(cfg.quantiles)}  point forecast: {cfg.median_column}")
     print(f"bootstrap: {args.n_boot:,} replications, clustered on dates\n")
 
-    rows, loss_frames = [], []
+    rows, loss_frames, grids = [], [], {}
     for model in present:
         arm = arm_of(model)
         forecasts = load_forecasts(forecast_root, model, folds)
@@ -465,8 +734,16 @@ def main() -> None:
         missing = int(scored["y"].isna().sum())
         if missing:
             raise SystemExit(f"{model}: {missing} forecasts have no outcome to score against")
-        print(f"  {model:<22} {arm:<11} {len(scored):>7,} forecasts over {len(folds)} folds")
-        rows.extend(build_rows(model, scored, cfg, denominators[arm], folds, args.n_boot))
+
+        grid = load_crps_grid(forecast_root, model, cfg)
+        assert_grid_matches_data(model, scored, grid, cfg)
+        grids[model] = grid
+
+        suffix = "" if grid.comparable else f"  [CRPS grid '{grid.label}', marked *]"
+        print(f"  {model:<22} {arm:<11} {len(scored):>7,} forecasts over "
+              f"{len(folds)} folds{suffix}")
+        rows.extend(build_rows(model, scored, cfg, denominators[arm], folds,
+                               args.n_boot, grid))
         loss_frames.append(build_losses(model, scored, cfg))
 
     if not rows:
@@ -485,12 +762,13 @@ def main() -> None:
     losses_out = Path(args.losses_out)
     losses.to_parquet(losses_out, index=False)
 
-    print_comparison(table)
-    print_volatility_arm(table)
-    print(f"\n{len(table)} cells -> {out.relative_to(ROOT)}")
+    print_comparison(table, grids)
+    print_volatility_arm(table, grids)
+    print_grid_notes(grids, cfg)
+    print(f"\n{len(table)} cells -> {_show(out)}")
     print(f"{len(losses):,} per-observation losses "
           f"({losses['loss_type'].nunique()} types x {losses['model'].nunique()} models) "
-          f"-> {losses_out.relative_to(ROOT)}")
+          f"-> {_show(losses_out)}")
 
 
 if __name__ == "__main__":
