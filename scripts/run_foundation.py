@@ -152,6 +152,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import inspect
 import json
 import sys
 import time
@@ -565,6 +566,83 @@ class TTMAdapter(Adapter):
         }
 
 
+class _NumpyProxy:
+    """Stands in for ``numpy`` inside the kronos module, and nowhere else.
+
+    ``kronos.py`` resolves ``np.mean`` through its own module globals, so
+    rebinding the *name* ``np`` in that namespace reaches its call sites and
+    leaves every other module's binding pointing at the real numpy. Mutating
+    ``kronos_module.np.mean`` instead would set the attribute on the numpy module
+    object itself, which is shared process-wide - an unrelated ``np.mean`` in any
+    other module would hit the shim for the duration. Measured, not assumed: the
+    module-mutation form makes an unrelated 4-d ``np.mean(..., axis=1)`` return
+    the shimmed value.
+
+    Everything except ``mean`` delegates. ``mean`` passes through only the exact
+    reduction that destroys the sample axis and delegates every other call,
+    including a 4-d axis-1 mean whose sample extent does not match.
+    """
+
+    def __init__(self, real_numpy, sample_count: int):
+        self._real = real_numpy
+        self._sample_count = sample_count
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def mean(self, a, axis=None, *args, **kwargs):
+        if (axis == 1 and isinstance(a, self._real.ndarray) and a.ndim == 4
+                and a.shape[1] == self._sample_count):
+            return a
+        return self._real.mean(a, axis=axis, *args, **kwargs)
+
+
+# The parameters this runner passes by name. Checked against the installed
+# function at load time: a keyword that no longer exists fails loudly at the
+# call, but a *positional* argument that has shifted passes temperature where
+# top_k belongs and returns plausible samples that are quietly wrong. This
+# adapter's output cannot be checked by reading it, so the signature is checked
+# instead.
+KRONOS_INFERENCE_PARAMS = (
+    "tokenizer", "model", "x", "x_stamp", "y_stamp", "max_context", "pred_len",
+    "clip", "T", "top_k", "top_p", "sample_count", "verbose")
+
+
+def _assert_kronos_signature(kronos_module) -> None:
+    """Every parameter this runner names must exist, and accept a keyword.
+
+    Checked once at load rather than trusted at the call site. A renamed or
+    removed parameter then fails here with the installed signature printed,
+    instead of at hour nine of a run - or, if the call were positional, not
+    failing at all.
+    """
+    fn = getattr(kronos_module, "auto_regressive_inference", None)
+    if fn is None:
+        raise SystemExit(
+            "model/kronos.py no longer exposes auto_regressive_inference. "
+            "predict() cannot be used instead - it averages the sample axis at "
+            "kronos.py:467 and would give nine copies of a mean path.")
+
+    params = inspect.signature(fn).parameters
+    missing = [p for p in KRONOS_INFERENCE_PARAMS if p not in params]
+    if missing:
+        raise SystemExit(
+            f"auto_regressive_inference is missing parameter(s) {missing}.\n"
+            f"  installed signature: ({', '.join(params)})\n"
+            "  Upstream changed the API. Re-read the function before running: "
+            "the sampling arguments are not interchangeable and a wrong mapping "
+            "produces plausible samples rather than an error.")
+
+    positional_only = [p for p in KRONOS_INFERENCE_PARAMS
+                       if params[p].kind is inspect.Parameter.POSITIONAL_ONLY]
+    if positional_only:
+        raise SystemExit(
+            f"auto_regressive_inference now takes {positional_only} "
+            "positional-only, so this runner cannot pass them by name.")
+    print(f"    signature     auto_regressive_inference"
+          f"({', '.join(KRONOS_INFERENCE_PARAMS)}) - all passed by keyword")
+
+
 class KronosAdapter(Adapter):
     name = "Kronos-small"
     series = "price"
@@ -585,6 +663,7 @@ class KronosAdapter(Adapter):
         from model import kronos as kronos_module
         self.torch = torch
         self.kronos_module = kronos_module
+        _assert_kronos_signature(kronos_module)
         tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
         model = Kronos.from_pretrained("NeoQuasar/Kronos-small")
         self.predictor = KronosPredictor(model, tokenizer, device=self.device,
@@ -603,28 +682,23 @@ class KronosAdapter(Adapter):
         the sample axis (``model/kronos.py:467``), and every public entry point
         goes through it, so there is no supported way to get the paths back.
         Rather than vendor a copy of the whole function - which would silently
-        rot the next time upstream changes the decode loop - the module's
-        ``np.mean`` is swapped for a shim that passes through *only* the
-        4-d, axis-1 reduction at the end and delegates everything else to the
-        real implementation untouched.
+        rot the next time upstream changes the decode loop - the name ``np`` in
+        that module is rebound to a proxy for the duration.
 
-        Narrow on purpose. If upstream adds another 4-d axis-1 mean inside this
-        function the shim would catch that too, which is why the caller asserts
-        the returned array still has the sample axis and the right extent.
+        Rebinding the name, not mutating the module: see ``_NumpyProxy``. The
+        blast radius is this one module between ``yield`` and ``finally``.
+
+        Narrow on purpose. If upstream adds another 4-d axis-1 mean over an array
+        whose second axis happens to be ``sample_count``, the proxy would pass
+        that through too, which is why the caller asserts the returned array
+        still carries the sample axis at the expected extent.
         """
-        real_mean = self.kronos_module.np.mean
-
-        def shim(a, axis=None, *args, **kwargs):
-            if (axis == 1 and isinstance(a, np.ndarray) and a.ndim == 4
-                    and a.shape[1] == self.sample_count):
-                return a
-            return real_mean(a, axis=axis, *args, **kwargs)
-
-        self.kronos_module.np.mean = shim
+        real_numpy = self.kronos_module.np
+        self.kronos_module.np = _NumpyProxy(real_numpy, self.sample_count)
         try:
             yield
         finally:
-            self.kronos_module.np.mean = real_mean
+            self.kronos_module.np = real_numpy
 
     def predict_bars(self, windows: np.ndarray, x_stamps: np.ndarray,
                      y_stamps: np.ndarray, last_close: np.ndarray,
@@ -646,13 +720,26 @@ class KronosAdapter(Adapter):
         xs = self.torch.tensor(x_stamps, dtype=self.torch.float32)
         ys = self.torch.tensor(y_stamps, dtype=self.torch.float32)
 
+        # Every argument by name. Positionally, an upstream insertion or reorder
+        # would pass temperature where top_k belongs and return samples that look
+        # entirely reasonable; by keyword the same change raises.
         with self._keep_sample_axis():
             with self.torch.no_grad():
                 paths = self.kronos_module.auto_regressive_inference(
-                    self.predictor.tokenizer, self.predictor.model,
-                    x.to(self.device), xs.to(self.device), ys.to(self.device),
-                    self.context, 1, self.predictor.clip,
-                    1.0, 0, 0.9, self.sample_count, False)
+                    tokenizer=self.predictor.tokenizer,
+                    model=self.predictor.model,
+                    x=x.to(self.device),
+                    x_stamp=xs.to(self.device),
+                    y_stamp=ys.to(self.device),
+                    max_context=self.context,
+                    pred_len=1,
+                    clip=self.predictor.clip,
+                    T=1.0,
+                    top_k=0,
+                    top_p=0.9,
+                    sample_count=self.sample_count,
+                    verbose=False,
+                )
 
         paths = np.asarray(paths)
         if paths.ndim != 4 or paths.shape[0] != n or paths.shape[1] != self.sample_count:
