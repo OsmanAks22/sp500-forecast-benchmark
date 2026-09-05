@@ -722,6 +722,16 @@ def forecast_fold(adapter: Adapter, bars: pd.DataFrame, split, our_grid,
         if dropped:
             print(f"      {ticker}: {dropped} origins lack {adapter.context} "
                   "sessions of history, skipped")
+        # An origin at the final session of the panel has no t+1, so
+        # make_target leaves its label NaN and there is nothing to score the
+        # forecast against - evaluate.py refuses a forecast with no outcome.
+        # This is what makes the count 1,669 sessions per ticker rather than the
+        # 1,670 in the windows, and it matches what the existing tiers write.
+        labelled = usable[usable < len(group) - 1]
+        if labelled.size != usable.size:
+            print(f"      {ticker}: {usable.size - labelled.size} origin at the "
+                  "final session has no forward return, skipped")
+        usable = labelled
         if usable.size == 0:
             continue
 
