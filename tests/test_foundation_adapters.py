@@ -13,6 +13,7 @@ Neither test needs a GPU or the kronos package.
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import sys
 import types
@@ -870,6 +871,133 @@ def test_implied_sigma_uses_the_normal_80_percent_span():
     assert runner.Q90_Q10_TO_SIGMA == pytest.approx(2.5631, abs=1e-4)
     assert runner.implied_daily_sigma(np.array([-1.28155]),
                                       np.array([1.28155])) == pytest.approx(1.0, abs=1e-4)
+
+
+# --------------------------------------------------------------------------
+# 11. the class must match the checkpoint's generation
+# --------------------------------------------------------------------------
+
+def test_the_entry_point_is_the_class_that_matches_the_checkpoint():
+    """TimesFM3Forecaster is the 3.0 wrapper; the checkpoint is 2.5."""
+    assert runner.TIMESFM_ENTRY_POINT == "TimesFM_2p5_200M_torch"
+    assert "3" not in runner.TIMESFM_ENTRY_POINT.replace("2p5", "")
+
+
+def test_forecast_is_preferred_because_it_is_this_class_own_method():
+    assert runner.TIMESFM_METHOD_PREFERENCE[0] == "forecast"
+    # The others stay as fallbacks rather than being removed.
+    assert "predict_batch" in runner.TIMESFM_METHOD_PREFERENCE
+
+
+def test_a_checkpoint_of_another_generation_is_rejected_by_architecture():
+    """The check the path-string comparison could not make.
+
+    The previous failure passed the right repository id to the wrong class, so
+    comparing the id proved nothing. The architecture the checkpoint declares
+    is what distinguishes them.
+    """
+    adapter = _timesfm_adapter()
+    adapter.declared_config = lambda: {"architectures": ["TimesFM3Torch"]}
+    with pytest.raises(SystemExit, match="not the 2.5 family"):
+        adapter._assert_checkpoint_is_the_pinned_one()
+
+    adapter.declared_config = lambda: TIMESFM_25_CONFIG
+    adapter._assert_checkpoint_is_the_pinned_one()          # must not raise
+
+
+def test_a_checkpoint_declaring_no_architecture_is_reported_not_assumed():
+    adapter = _timesfm_adapter()
+    adapter.declared_config = lambda: {"quantiles": [0.1, 0.5, 0.9]}
+    adapter._assert_checkpoint_is_the_pinned_one()          # must not raise
+
+
+def test_the_layout_is_still_resolved_and_not_hardcoded():
+    """The measured offset must be re-derived, not written in.
+
+    The offset was handed to this project as a measurement. A measurement one
+    person makes is still one the next has to reproduce, so the resolver keeps
+    deciding it from the returned point forecast.
+    """
+    source = inspect.getsource(runner.TimesFMAdapter.predict)
+    assert "_resolve_layout" in source
+    assert "self.channel_layout = 1" not in source
+
+    adapter = _timesfm_adapter()
+    levels = np.asarray(runner.TIMESFM_NATIVE_GRID)
+    # The measured Kaggle shape: channel 0 the point, 1-9 the deciles.
+    rows = np.stack([np.concatenate([[0.5], levels]) for _ in range(4)])
+    assert adapter._resolve_layout(rows, np.full(4, 0.5)) == 1
+
+
+def test_the_probe_runs_before_any_fold_and_reports_the_channel_count():
+    """One forward pass at load, so a mismatch costs a pass and not a fold."""
+    adapter = _timesfm_adapter()
+    adapter.method_name = "forecast"
+    captured = {}
+
+    def fake_forecast(horizon, inputs):
+        captured["n"] = len(inputs)
+        captured["len"] = len(inputs[0])
+        n = len(inputs)
+        return np.zeros((n, 1)), np.zeros((n, 1, 10))
+
+    adapter.method = fake_forecast
+    assert adapter.probe_output_channels() == 10
+    assert captured == {"n": 1, "len": 512}
+
+
+def test_the_probe_feeds_a_return_scale_context_not_zeros():
+    """A degenerate context can produce a degenerate head response."""
+    adapter = _timesfm_adapter()
+    adapter.method_name = "forecast"
+    seen = {}
+
+    def fake_forecast(horizon, inputs):
+        seen["ctx"] = np.asarray(inputs[0])
+        return np.zeros((1, 1)), np.zeros((1, 1, 10))
+
+    adapter.method = fake_forecast
+    adapter.probe_output_channels()
+    ctx = seen["ctx"]
+    assert np.isfinite(ctx).all() and ctx.std() > 0
+    assert ctx.std() < 0.1, "the probe context must be on a return scale"
+
+
+def test_the_base_adapter_probe_defaults_to_skipping():
+    """Kronos cannot be probed cheaply; skipping is not failing."""
+    adapter = runner.KronosAdapter(
+        our_grid=(0.1, 0.5, 0.9), context=512, device="cpu", batch=8,
+        sample_count=100)
+    assert adapter.probe_output_channels() is None
+
+
+def test_grid_note_reasoning_no_longer_cites_the_wrong_loader():
+    """The conclusion was right; the reason came from the broken model."""
+    adapter = _timesfm_adapter()
+    adapter.native = list(runner.TIMESFM_NATIVE_GRID)
+    adapter.direct = [0.1, 0.5, 0.9]
+    adapter.interpolated = [0.25, 0.75]
+    adapter.unavailable = [0.01, 0.05, 0.95, 0.99]
+    note = adapter.grid_note()["notes"]
+    assert "timesfm3_forecaster.py:398" not in note
+    assert "ForecastConfig carries no quantile field" in note
+    assert "frozen dataclass" in note
+    assert "relabel the channels rather than retarget" in note
+    # The conclusion itself is unchanged.
+    assert "never extrapolated" in note
+    assert "its own nine levels" in note
+
+
+def test_grid_note_records_the_entry_point_and_the_verified_layout():
+    adapter = _timesfm_adapter()
+    adapter.native = list(runner.TIMESFM_NATIVE_GRID)
+    adapter.direct, adapter.interpolated = [0.1], [0.25]
+    adapter.unavailable = [0.01]
+    adapter.channel_layout = 1
+    note = adapter.grid_note()
+    assert note["entry_point"] == "timesfm.TimesFM_2p5_200M_torch"
+    assert note["channel_layout_offset"] == 1
+    assert "not hardcoded" in note["channel_layout_verified_against"]
 
 
 def test_the_proxy_matches_the_chunk_extent_not_the_full_sample_count():

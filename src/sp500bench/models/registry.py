@@ -97,13 +97,29 @@ REGISTRY: list[ModelSpec] = [
               "smoke-test run to discover. Recorded here so the real run does not "
               "rediscover it.",
               {"checkpoint": "google/timesfm-2.5-200m-pytorch",
-               "entry_point": "timesfm.TimesFM3Forecaster",
+               # CORRECTED 6 September 2026, after the first run of this spec
+               # produced invalid forecasts. TimesFM3Forecaster is the 3.0
+               # wrapper; it builds a TimesFM3Torch from the checkpoint's own
+               # config.json, of whose keys exactly one - quantiles - is also a
+               # TimesFM3Torch constructor argument. Every other architecture
+               # field was dropped, the model was built at 3.0 defaults, and the
+               # 2.5 weights had nowhere to land. The run completed without
+               # error and every assertion in the adapter passed.
+               "entry_point": "timesfm.TimesFM_2p5_200M_torch",
+               "entry_point_superseded": "timesfm.TimesFM3Forecaster",
                # Settled on the GPU, 6 September 2026. The entry point was
                # right and the method was not: TimesFM3Forecaster exposes
                # predict and predict_batch, and no forecast at all - forecast
                # belongs to the TimesFM_2p5 base class, and calling it cost a
                # Kaggle run. Recorded so the next one does not rediscover it.
-               "inference_method": "predict_batch",
+               # forecast(horizon, inputs) -> (point, quantiles), inherited from
+               # TimesFM_2p5. compile(ForecastConfig(...)) is mandatory first;
+               # forecast() raises "Model is not compiled" without it.
+               # predict_batch belongs to the 3.0 forecaster and does not exist
+               # on this class.
+               "inference_method": "forecast",
+               "inference_method_superseded": "predict_batch",
+               "requires_compile": True,
                # The checkpoint MUST be passed explicitly. _ModelConfig
                # defaults checkpoint_path to google/timesfm-3.0-pytorch, so
                # constructing the forecaster with no argument loads a
@@ -117,7 +133,14 @@ REGISTRY: list[ModelSpec] = [
                # documents two layouts (a 10-channel head with the point
                # forecast first, and this one) and choosing wrongly shifts
                # every level by one while changing no shape.
-               "channel_layout": "9 channels, offset 0, median verified",
+               # 10 channels: channel 0 the point forecast, 1-9 the deciles,
+               # decode_index 5 landing on the median. Measured on the correct
+               # class. The nine observed under the wrong class were the 3.0
+               # head's, and the layout resolver could not have caught it: it
+               # verifies the median channel against the library's own point
+               # forecast, and both came from the same unloaded network.
+               "channel_layout": "10 channels, offset 1, median verified",
+               "channel_layout_superseded": "9 channels, offset 0",
                "pretrain_cutoff": "undocumented"}),
     # EXCLUDED 5 September 2026, after the Kaggle smoke test and before any
     # result. The spec is kept rather than deleted: it was pre-registered, it

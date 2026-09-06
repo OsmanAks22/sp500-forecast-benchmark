@@ -180,18 +180,24 @@ FOUNDATION_MODELS = ["Chronos-2", "TimesFM-2.5", "TTM", "Kronos-small"]
 # against the loaded checkpoint before use.
 TIMESFM_NATIVE_GRID = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
 
-# Must be passed explicitly. `_ModelConfig.checkpoint_path` defaults to
-# "google/timesfm-3.0-pytorch", so constructing TimesFM3Forecaster() with no
-# arguments silently loads 3.0 - a different model from the pre-registered one,
-# with an output shape identical enough that nothing downstream would notice.
 TIMESFM_CHECKPOINT = "google/timesfm-2.5-200m-pytorch"
 
-# Tried in this order. `predict_batch` first because it is the batched entry
-# point and the others are wrappers around it or older spellings; `forecast`
-# is the TimesFM_2p5 base-class name, which is NOT on the forecaster - calling
-# it was what failed on Kaggle - but is kept in the order in case a future
-# release moves the surface back.
-TIMESFM_METHOD_PREFERENCE = ("predict_batch", "predict", "forecast",
+# The class that matches the checkpoint. It was in the namespace from the first
+# smoke test and went unused for two runs while TimesFM3Forecaster - the 3.0
+# wrapper - was used instead. Its own DEFAULT_REPO_ID is this checkpoint.
+#
+# The two are not interchangeable. The 3.0 wrapper builds a TimesFM3Torch from
+# the repo's config.json, and that config's keys are the 2.5 architecture's
+# names, of which exactly one (`quantiles`) is also a TimesFM3Torch constructor
+# argument. Every other architecture field was therefore dropped and the model
+# was built at 3.0 defaults, so the 2.5 weights had nowhere to land.
+TIMESFM_ENTRY_POINT = "TimesFM_2p5_200M_torch"
+
+# `forecast` first because it is this class's own inference method, inherited
+# from TimesFM_2p5 and requiring compile() beforehand. The others stay as
+# fallbacks in case a future release moves the surface; discovery still reports
+# whichever it finds rather than this file assuming one.
+TIMESFM_METHOD_PREFERENCE = ("forecast", "predict_batch", "predict",
                              "generate", "__call__")
 
 # Names worth dumping the signature of when discovery fails.
@@ -729,8 +735,20 @@ class Adapter:
         """
         return None
 
+    def declared_config(self) -> dict | None:
+        """What the checkpoint says about itself, not what the class defaults to."""
+        return _checkpoint_config(self.checkpoint)
+
+    def probe_output_channels(self) -> int | None:
+        """One forward pass at load time to fix the channel count, or None.
+
+        ``None`` means this model cannot be probed cheaply - Kronos would have
+        to sample - and the check falls back to the first real batch.
+        """
+        return None
+
     def assert_channels_match_checkpoint(self, observed: int) -> None:
-        config = _checkpoint_config(self.checkpoint)
+        config = self.declared_config()
         if config is None:
             print(f"    channels      {observed} observed; checkpoint config not "
                   "in the local cache, so nothing to check it against")
@@ -858,7 +876,8 @@ class TimesFMAdapter(Adapter):
 
     def load(self) -> None:
         import timesfm
-        entry = "TimesFM3Forecaster"
+        from timesfm import ForecastConfig
+        entry = TIMESFM_ENTRY_POINT
         if not hasattr(timesfm, entry):
             raise SystemExit(
                 f"timesfm.{entry} is gone. Namespace: "
@@ -867,29 +886,36 @@ class TimesFMAdapter(Adapter):
         cls = getattr(timesfm, entry)
 
         # Named, never defaulted: see TIMESFM_CHECKPOINT.
-        if hasattr(cls, "from_pretrained"):
-            self.model = cls.from_pretrained(TIMESFM_CHECKPOINT,
-                                             device=self.device)
-        else:
-            self.model = cls(checkpoint_path=TIMESFM_CHECKPOINT)
+        self.model = cls.from_pretrained(TIMESFM_CHECKPOINT)
         print(f"    checkpoint    {TIMESFM_CHECKPOINT} (passed explicitly)")
+        print(f"    class         timesfm.{entry}, whose DEFAULT_REPO_ID is "
+              f"{getattr(cls, 'DEFAULT_REPO_ID', 'unset')!r}")
         self._assert_checkpoint_is_the_pinned_one()
+
+        # Mandatory. forecast() raises "Model is not compiled" without it.
+        # max_horizon is rounded up to the output patch size internally; we ask
+        # for 1 and slice, which is what the horizon in configs/eval.yaml is.
+        self.model.compile(ForecastConfig(
+            max_context=self.context, max_horizon=1,
+            normalize_inputs=True, per_core_batch_size=self.batch))
+        print(f"    compiled      max_context={self.context} max_horizon=1 "
+              f"normalize_inputs=True per_core_batch_size={self.batch}")
 
         self.method_name, self.method = _discover_inference_method(
             self.model, TIMESFM_METHOD_PREFERENCE, entry)
 
-        config = getattr(self.model, "config", None)
-        native = list(getattr(config, "quantiles", None)
-                      or getattr(self.model, "quantiles", TIMESFM_NATIVE_GRID))
-        # Not hardcoded. timesfm3's _ModelConfig says median_quantile_index 4
-        # while the 2.5 model definition says decode_index 5 over a 10-channel
-        # head - two different layouts. Which one this checkpoint returns is
-        # settled in predict(), against the library's own `forecast` field.
-        self.median_index_hint = getattr(config, "median_quantile_index", None)
+        native = list(self._native_grid() or TIMESFM_NATIVE_GRID)
+        # The layout is NOT taken from the measurement that identified it. Two
+        # layouts exist in this package and they disagree about where the median
+        # sits; _resolve_layout settles it on the first batch against the
+        # library's own returned point forecast, on this checkpoint as it would
+        # on any other. A measured fact handed to the author is still a fact the
+        # next person has to be able to reproduce.
+        self.median_index_hint = getattr(
+            getattr(self.model, "model", None), "aridx", None)
         self.channel_layout = None
-        print(f"    median hint   config.median_quantile_index="
-              f"{self.median_index_hint} (verified against the returned "
-              "point forecast on the first batch)")
+        print(f"    median hint   decode_index={self.median_index_hint} "
+              "(not trusted; verified against the returned point forecast)")
         print(f"    native grid   {len(native)} levels: {native}")
         if not np.allclose(native, TIMESFM_NATIVE_GRID, atol=1e-12):
             raise SystemExit(
@@ -926,16 +952,65 @@ class TimesFMAdapter(Adapter):
             return len(levels) + 1
         return len(levels)
 
+    def _native_grid(self) -> list | None:
+        """The nine levels the trained head emits, from the model itself."""
+        for holder in (getattr(self.model, "model", None), self.model):
+            config = getattr(holder, "config", None)
+            levels = getattr(config, "quantiles", None)
+            if levels:
+                return list(levels)
+        declared = self.declared_config() or {}
+        return list(declared.get("quantiles") or []) or None
+
+    def declared_config(self) -> dict | None:
+        """What the checkpoint says about itself.
+
+        ``from_pretrained`` stores the repo's config.json on the model as
+        ``_hub_mixin_config``, which is more direct than reading the cache and
+        works wherever the cache lives. Falls back to the cache.
+        """
+        # getattr on self too: this is reachable before load(), and a config
+        # accessor that raises is worse than one that falls back.
+        model = getattr(self, "model", None)
+        config = getattr(model, "_hub_mixin_config", None)
+        if isinstance(config, dict) and config:
+            return config
+        return _checkpoint_config(self.checkpoint)
+
     def _assert_checkpoint_is_the_pinned_one(self) -> None:
-        """The loaded checkpoint must be the one the roster names."""
-        config = getattr(self.model, "config", None)
-        loaded = getattr(config, "checkpoint_path", None)
-        if loaded is not None and str(loaded) != TIMESFM_CHECKPOINT:
+        """The class and the checkpoint must belong to the same generation.
+
+        The previous failure was not a wrong repository id - that was passed
+        correctly and this check passed. It was the wrong class for a correct
+        id, which no comparison of path strings can see. So compare the
+        architecture the checkpoint declares against the one this class is.
+        """
+        declared = self.declared_config() or {}
+        architectures = " ".join(declared.get("architectures") or [])
+        if not architectures:
+            print("    architecture  checkpoint declares none; cannot verify "
+                  "the class against it")
+            return
+        if not ("TimesFm" in architectures or "2p5" in architectures):
             raise SystemExit(
-                f"TimesFM loaded {loaded!r}, not the pre-registered "
-                f"{TIMESFM_CHECKPOINT!r}. The config default is a different "
-                "model generation and its output shape is close enough that "
-                "nothing downstream would catch the substitution.")
+                f"{self.checkpoint!r} declares architecture "
+                f"{architectures!r}, which is not the 2.5 family this class "
+                f"({TIMESFM_ENTRY_POINT}) implements. Loading a checkpoint into "
+                "a class of another generation leaves the weights unplaced and "
+                "the model still returns forecasts.")
+        print(f"    architecture  checkpoint declares {architectures!r}, "
+              "matching this class's generation")
+
+    def probe_output_channels(self) -> int | None:
+        """One synthetic origin, before any fold, to fix the channel count.
+
+        Checked here rather than on the first real batch so that a class and
+        checkpoint that disagree cost one forward pass instead of a fold.
+        """
+        rng = np.random.default_rng(20260906)
+        context = rng.normal(0.0, 0.01, self.context)      # return-scale noise
+        quantiles, _ = self._as_arrays(self._call(np.stack([context])), 1)
+        return int(quantiles.shape[-1])
 
     def _call(self, contexts: np.ndarray):
         """Invoke whichever method discovery found, with its own argument shape."""
@@ -1070,20 +1145,37 @@ class TimesFMAdapter(Adapter):
             "frozen_levels_interpolated": list(self.interpolated),
             "frozen_levels_unavailable": list(self.unavailable),
             "notes": (
-                "TimesFM-2.5 emits a fixed nine-decile grid [0.1..0.9] and the "
-                "level set is not settable - timesfm3_forecaster.py:398 "
-                "overwrites config.quantiles with the trained head's own on "
-                "load. The frozen grid's 0.01/0.05/0.95/0.99 lie outside that "
-                "range and are written NaN, never extrapolated: a value at a "
-                "level the head was never trained to emit would measure our "
-                "extrapolation rule, not the model's uncertainty. Its CRPS must "
-                "therefore be computed over its own nine levels, from the "
-                "native columns in this file, and every table carrying it must "
-                "mark it as on a different grid and not directly comparable on "
-                "CRPS to models scored on the full nine. A common-subset "
-                "comparison was rejected because it would discard the tail "
-                "information Chronos-2 and Kronos do carry, and H2 is about "
-                "calibration."),
+                "TimesFM-2.5 emits nine deciles [0.1..0.9] on a head trained "
+                "for exactly those levels, plus a separate point channel. The "
+                "level set is not settable, and the reason is the head itself, "
+                "not any particular loader: ForecastConfig carries no quantile "
+                "field at all, and TimesFM_2p5_200M_Definition is a frozen "
+                "dataclass whose quantiles are the ones the weights were "
+                "trained on. Passing a different list would relabel the "
+                "channels rather than retarget them - you would ask for q0.01 "
+                "and be handed the q0.1 channel under a new name. "
+                "This wording was rewritten after the checkpoint was run "
+                "through the class that matches it; the previous version "
+                "attributed the fixed grid to a line in the 3.0 forecaster, "
+                "which was a property of the wrong loader and reached the right "
+                "conclusion for the wrong reason. "
+                "So the frozen grid's 0.01/0.05/0.95/0.99 lie outside what the "
+                "head can express and are written NaN, never extrapolated: a "
+                "value at a level the head was never trained to emit would "
+                "measure our extrapolation rule, not the model's uncertainty. "
+                "Its CRPS must therefore be computed over its own nine levels, "
+                "from the native columns in this file, and every table carrying "
+                "it must mark it as on a different grid and not directly "
+                "comparable on CRPS to models scored on the full nine. A "
+                "common-subset comparison was rejected because it would discard "
+                "the tail information Chronos-2 and Kronos do carry, and H2 is "
+                "about calibration."),
+            "entry_point": f"timesfm.{TIMESFM_ENTRY_POINT}",
+            "inference_method": getattr(self, "method_name", None),
+            "channel_layout_offset": self.channel_layout,
+            "channel_layout_verified_against": (
+                "the library's own returned point forecast, on the first batch "
+                "of this run - not hardcoded from a prior measurement"),
         }
 
 
@@ -1881,6 +1973,14 @@ def run_model(adapter: Adapter, bars: pd.DataFrame, walk_forward: PurgedWalkForw
         else:
             recorder.assert_clean(adapter.name, adapter.checkpoint)
     load_seconds = time.perf_counter() - t_load
+
+    # Before any fold: a class and a checkpoint that disagree about the output
+    # shape should cost one forward pass, not a fold of forecasts that look
+    # plausible until someone checks their magnitude.
+    observed_channels = adapter.probe_output_channels()
+    if observed_channels is not None:
+        adapter.assert_channels_match_checkpoint(observed_channels)
+        adapter._channels_checked = True
     print(f"    loaded in {load_seconds:.1f}s")
 
     (model_dir / "grid.json").write_text(
