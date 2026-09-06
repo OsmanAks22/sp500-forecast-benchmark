@@ -247,6 +247,131 @@ def show(path: Path) -> str:
 # timings
 # --------------------------------------------------------------------------
 
+# q0.9 - q0.1 spans 2 * Phi^-1(0.9) standard deviations of a normal.
+Q90_Q10_TO_SIGMA = 2.0 * 1.2815515655446004          # 2.5631
+
+# Sanity bands on the implied daily sigma of a predictive distribution.
+#
+# NOT PRINCIPLED. These are empirical guardrails calibrated to this panel -
+# fifty large-cap US equities, 2005-2026 - and they would be wrong for another
+# asset class, another universe, or another horizon. They exist to catch a
+# model that is off by a factor, not to judge one that is off by a few percent.
+#
+# Return arm: the realised 1-day log return has sd 0.0183 on this panel, 0.0109
+# to 0.0305 per ticker. The band spans roughly a ninth of that to four and a
+# half times it, so a fold as violent as 2020 stays comfortably inside while a
+# fivefold error does not.
+#
+# Volatility arm: a different quantity on a different scale - the 21-session
+# forward Yang-Zhang estimate, whose values run 0.0065 to 0.0572 between the
+# 1st and 99th percentiles with sd 0.0096. A single global band would pass
+# anything the return arm allows and so would never fire here.
+SIGMA_BANDS = {
+    "return": (0.002, 0.08),
+    "volatility": (0.0002, 0.03),
+}
+
+
+def implied_daily_sigma(q10: np.ndarray, q90: np.ndarray) -> float:
+    """Predictive sigma implied by the 80% interval, ignoring non-finite rows."""
+    width = np.asarray(q90, dtype=float) - np.asarray(q10, dtype=float)
+    width = width[np.isfinite(width)]
+    if not width.size:
+        return float("nan")
+    return float(np.mean(width) / Q90_Q10_TO_SIGMA)
+
+
+def _checkpoint_config(repo_id: str | None) -> dict | None:
+    """The checkpoint's own config.json, from the local cache.
+
+    What the checkpoint declares about itself, as opposed to what the class the
+    runner happens to construct defaults to. Those are different objects, and
+    the difference is exactly what went unnoticed on TimesFM.
+    """
+    if not repo_id:
+        return None
+    revision, _ = _hf_cache_revision(repo_id)
+    roots = [os.environ.get("HF_HUB_CACHE"),
+             os.environ.get("HUGGINGFACE_HUB_CACHE"),
+             os.path.join(os.environ["HF_HOME"], "hub")
+             if os.environ.get("HF_HOME") else None,
+             os.path.expanduser("~/.cache/huggingface/hub")]
+    folder = "models--" + repo_id.replace("/", "--")
+    for root in roots:
+        if not root:
+            continue
+        base = Path(root) / folder
+        candidates = []
+        if revision:
+            candidates.append(base / "snapshots" / revision / "config.json")
+        candidates.extend(sorted(base.glob("snapshots/*/config.json")))
+        for candidate in candidates:
+            if candidate.is_file():
+                try:
+                    return json.loads(candidate.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
+    return None
+
+
+class _StateDictLoadRecorder:
+    """Capture what ``load_state_dict`` reported, which the loaders discard.
+
+    ``PyTorchModelHubMixin`` and friends call ``load_state_dict`` internally and
+    throw away its return value, so a non-strict load that matched almost
+    nothing looks exactly like a successful one - the model is constructed, the
+    call returns, and the weights are whatever the constructor initialised. That
+    is how a checkpoint can fail to load and still produce forecasts.
+
+    ``torch.nn.Module.load_state_dict`` is patched for the duration of the load
+    and restored in ``finally``. Narrow and temporary, for the same reason the
+    numpy proxy is: the blast radius of a patched framework method should be one
+    call, not a process.
+    """
+
+    def __init__(self, torch_module):
+        self.torch = torch_module
+        self.results: list[tuple[list, list]] = []
+
+    def __enter__(self):
+        real = self.torch.nn.Module.load_state_dict
+        self._real = real
+        results = self.results
+
+        def recording(module_self, state_dict, *args, **kwargs):
+            out = real(module_self, state_dict, *args, **kwargs)
+            missing = list(getattr(out, "missing_keys", []) or [])
+            unexpected = list(getattr(out, "unexpected_keys", []) or [])
+            results.append((missing, unexpected))
+            return out
+
+        self.torch.nn.Module.load_state_dict = recording
+        return self
+
+    def __exit__(self, *exc):
+        self.torch.nn.Module.load_state_dict = self._real
+        return False
+
+    def assert_clean(self, model_name: str, checkpoint: str | None) -> None:
+        missing = sorted({k for m, _ in self.results for k in m})
+        unexpected = sorted({k for _, u in self.results for k in u})
+        if not (missing or unexpected):
+            n = len(self.results)
+            print(f"    weights       {n} load_state_dict call(s), no missing or "
+                  "unexpected keys")
+            return
+        raise SystemExit(
+            f"{model_name}: the checkpoint did not load cleanly from "
+            f"{checkpoint!r}.\n"
+            f"  missing keys    ({len(missing)}): {missing[:8]}"
+            f"{' ...' if len(missing) > 8 else ''}\n"
+            f"  unexpected keys ({len(unexpected)}): {unexpected[:8]}"
+            f"{' ...' if len(unexpected) > 8 else ''}\n"
+            "  A non-strict load leaves the unmatched parameters at their\n"
+            "  constructor initialisation, so the model runs and produces\n"
+            "  forecasts that are not this checkpoint's. Refusing to continue.")
+
+
 def _distribution_version(dist: str | None) -> str | None:
     if not dist:
         return None
@@ -309,7 +434,13 @@ def _torch_version() -> str | None:
 # Fields that identify the run a timing belongs to. Per-fold times measured
 # under different settings are not the same measurement and must not be merged.
 RUN_IDENTITY_FIELDS = ("context", "device", "sample_count", "precision",
-                       "paths_per_call", "checkpoint", "checkpoint_revision")
+                       "paths_per_call", "checkpoint", "checkpoint_revision",
+                       # What the generic TSFMs were fed - returns or prices -
+                       # is a documented decision of this runner and changes
+                       # what the model was asked to do, not merely how fast it
+                       # did it. Folds measured under different input series
+                       # are different measurements.
+                       "input_series")
 
 
 def _merge_timing(prior: dict | None, payload: dict) -> dict:
@@ -360,13 +491,41 @@ def _merge_timing(prior: dict | None, payload: dict) -> dict:
         return merged
 
     merged_folds = {**measured_before, **measured_now}
-    merged_rows = {**(prior.get("forecasts_per_fold") or {}),
-                   **(payload.get("forecasts_per_fold") or {})}
+    prior_rows = prior.get("forecasts_per_fold") or {}
+    payload_rows = payload.get("forecasts_per_fold") or {}
+
     out = dict(payload)
     out["seconds_per_fold"] = merged_folds
-    out["forecasts_per_fold"] = merged_rows
     out["n_folds"] = len(merged_folds)
-    out["n_forecasts"] = sum(merged_rows.values()) if merged_rows else payload.get("n_forecasts", 0)
+
+    if prior_rows or not measured_before:
+        # Both sides attribute rows per fold, so the total is recomputable.
+        merged_rows = {**prior_rows, **payload_rows}
+        if set(merged_rows) != set(merged_folds):
+            raise ValueError(
+                f"timing merge is inconsistent: folds {sorted(merged_folds)} "
+                f"have times but {sorted(merged_rows)} have row counts. "
+                "Writing a total over a fold set that does not match the "
+                "timed set produces a record that contradicts itself, which "
+                "is worse than failing here.")
+        out["forecasts_per_fold"] = merged_rows
+        out["n_forecasts"] = sum(merged_rows.values())
+    else:
+        # The prior predates forecasts_per_fold, so its rows cannot be split by
+        # fold and summing only the new fold would write that fold's count over
+        # the whole run's - 12,650 over 83,450, with nothing saying so.
+        # Re-measuring a fold does not change how many rows it produced, so the
+        # prior total stands; only genuinely new folds add to it.
+        new_folds = set(payload_rows) - set(measured_before)
+        out["forecasts_per_fold"] = payload_rows
+        out["n_forecasts"] = (int(prior.get("n_forecasts", 0))
+                              + sum(payload_rows[f] for f in new_folds))
+        out["n_forecasts_from_legacy_prior"] = True
+        out["n_forecasts_note"] = (
+            "the prior record predates forecasts_per_fold, so rows could not "
+            "be attributed per fold; the prior total was carried forward and "
+            "only folds it did not contain were added to it")
+
     total = sum(merged_folds.values())
     out["seconds_steady_state_total"] = round(total, 3)
     out["seconds_steady_state_mean"] = (round(total / len(merged_folds), 3)
@@ -556,6 +715,74 @@ class Adapter:
     def predict(self, contexts: np.ndarray) -> tuple[np.ndarray, dict]:
         raise NotImplementedError
 
+    arm = "return"                 # every foundation spec is on the return arm
+    _channels_checked = False
+    _scale_checked = False
+
+    def expected_channels(self, config: dict) -> int | None:
+        """How many output channels this checkpoint's own config implies.
+
+        ``None`` means the config does not say, and the check is skipped rather
+        than guessed. Overridden per adapter; the point is that the number comes
+        from the checkpoint, not from the class the runner constructed - those
+        are different objects and their disagreement is silent.
+        """
+        return None
+
+    def assert_channels_match_checkpoint(self, observed: int) -> None:
+        config = _checkpoint_config(self.checkpoint)
+        if config is None:
+            print(f"    channels      {observed} observed; checkpoint config not "
+                  "in the local cache, so nothing to check it against")
+            return
+        expected = self.expected_channels(config)
+        if expected is None:
+            print(f"    channels      {observed} observed; the checkpoint config "
+                  "does not imply a channel count")
+            return
+        if observed != expected:
+            raise SystemExit(
+                f"{self.name}: the model returned {observed} output channels "
+                f"but {self.checkpoint!r} declares an architecture implying "
+                f"{expected}.\n"
+                "  The constructed class and the checkpoint disagree, which "
+                "means the weights\n"
+                "  were loaded into the wrong architecture - the output is "
+                "that class's\n"
+                "  initialisation, not this checkpoint's forecast.")
+        print(f"    channels      {observed}, matching what {self.checkpoint} "
+              "declares")
+
+    def assert_sigma_in_band(self, levels: np.ndarray) -> None:
+        """First-batch scale check. See SIGMA_BANDS - empirical, not principled."""
+        grid = list(self.our_grid)
+        if 0.1 not in grid or 0.9 not in grid:
+            return
+        sigma = implied_daily_sigma(levels[:, grid.index(0.1)],
+                                    levels[:, grid.index(0.9)])
+        if not np.isfinite(sigma):
+            print("    scale         no finite 80% interval on the first batch; "
+                  "band check skipped")
+            return
+        low, high = SIGMA_BANDS[self.arm]
+        annualised = sigma * np.sqrt(252) * 100
+        if not (low <= sigma <= high):
+            raise SystemExit(
+                f"{self.name}: implied daily sigma {sigma:.5f} "
+                f"({annualised:.1f}% annualised) is outside the {self.arm}-arm "
+                f"band [{low}, {high}] on the first batch.\n"
+                "  This is a scale guardrail calibrated to this panel, not a "
+                "principled bound;\n"
+                "  it fires on errors of a factor, not of a few percent. A "
+                "model this far from\n"
+                "  the realised scale is almost always a loading or "
+                "normalisation fault, not a\n"
+                "  forecast. Check the checkpoint and the input series before "
+                "spending a run.")
+        print(f"    scale         implied daily sigma {sigma:.5f} "
+              f"({annualised:.1f}% ann), inside the {self.arm} band "
+              f"[{low}, {high}]")
+
     def provenance(self) -> dict:
         """Exactly which weights and which code produced this run."""
         revision, source = _hf_cache_revision(self.checkpoint)
@@ -594,6 +821,10 @@ class ChronosAdapter(Adapter):
                 "quantile set changed; the mapping in this file is out of date.")
         self.native = native
 
+    def expected_channels(self, config: dict) -> int | None:
+        levels = (config.get("chronos_config") or {}).get("quantiles")
+        return len(levels) if levels else None
+
     def predict(self, contexts: np.ndarray) -> tuple[np.ndarray, dict]:
         n = len(contexts)
         # (n_series, n_variates, history_length) per pipeline.py:488
@@ -613,6 +844,9 @@ class ChronosAdapter(Adapter):
                 f"{len(self.native)} native levels and horizon 1. base.py:129 "
                 "documents the opposite order for predict_quantiles; do not "
                 "reuse that layout here.")
+        if not self._channels_checked:
+            self.assert_channels_match_checkpoint(int(n_q))
+            self._channels_checked = True
         values = stacked[:, 0, :, 0]                      # (n, n_quantiles)
         return _select_our_levels(self.native, self.our_grid, values), {}
 
@@ -673,6 +907,24 @@ class TimesFMAdapter(Adapter):
                             if q < min(native) or q > max(native)]
         print(f"    frozen grid   direct {self.direct} | "
               f"interpolated {self.interpolated} | NaN {self.unavailable}")
+
+    def expected_channels(self, config: dict) -> int | None:
+        """What the 2.5 checkpoint declares, not what TimesFM3Torch defaults to.
+
+        A checkpoint whose declared architecture is the 2.5 family emits one
+        channel per level plus a point channel (timesfm_2p5_torch.py:53,
+        ``len(quantiles) + 1``). The 3.0 class emits one per level and no point
+        channel. Loading the former into the latter yields a model with the
+        right number of levels and the wrong everything else, which is what
+        happened here: nine channels observed where the checkpoint implies ten.
+        """
+        levels = config.get("quantiles")
+        if not levels:
+            return None
+        architectures = " ".join(config.get("architectures") or [])
+        if "TimesFm" in architectures or "2p5" in architectures:
+            return len(levels) + 1
+        return len(levels)
 
     def _assert_checkpoint_is_the_pinned_one(self) -> None:
         """The loaded checkpoint must be the one the roster names."""
@@ -786,6 +1038,8 @@ class TimesFMAdapter(Adapter):
                 f"TimesFM returned {quantiles.shape[0]} rows for {n} contexts")
 
         if self.channel_layout is None:
+            self.assert_channels_match_checkpoint(int(quantiles.shape[-1]))
+            self._channels_checked = True
             self.channel_layout = self._resolve_layout(quantiles, point)
         offset = self.channel_layout
         native_values = quantiles[:, offset:offset + len(self.native)]
@@ -1549,6 +1803,9 @@ def forecast_fold(adapter: Adapter, bars: pd.DataFrame, split, our_grid,
                 y_stamps = stamps[chunk + 1][:, None, :]
                 levels, extras = adapter.predict_bars(
                     windows, x_stamps, y_stamps, closes[chunk])
+                if not adapter._scale_checked:
+                    adapter.assert_sigma_in_band(levels)
+                    adapter._scale_checked = True
                 for j, q in enumerate(our_grid):
                     out.loc[start:start + len(chunk) - 1, quantile_column(q)] = levels[:, j]
                 for k, v in extras.items():
@@ -1564,6 +1821,9 @@ def forecast_fold(adapter: Adapter, bars: pd.DataFrame, split, our_grid,
             for start in range(0, len(contexts), adapter.batch):
                 block = contexts[start:start + adapter.batch]
                 levels, extras = adapter.predict(block)
+                if not adapter._scale_checked:
+                    adapter.assert_sigma_in_band(levels)
+                    adapter._scale_checked = True
                 for j, q in enumerate(our_grid):
                     out.loc[start:start + len(block) - 1, quantile_column(q)] = levels[:, j]
                 for k, v in extras.items():
@@ -1597,7 +1857,29 @@ def run_model(adapter: Adapter, bars: pd.DataFrame, walk_forward: PurgedWalkForw
 
     print(f"\n{adapter.name}")
     t_load = time.perf_counter()
-    adapter.load()
+    # Every adapter's load goes through this: the loaders discard what
+    # load_state_dict reports, so a checkpoint that matched almost nothing looks
+    # exactly like one that loaded.
+    recorder = None
+    try:
+        import torch
+        recorder = _StateDictLoadRecorder(torch)
+    except ImportError:
+        pass
+    if recorder is None:
+        adapter.load()
+    else:
+        with recorder:
+            adapter.load()
+        if args.allow_inexact_load:
+            missing = sorted({k for m, _ in recorder.results for k in m})
+            unexpected = sorted({k for _, u in recorder.results for k in u})
+            if missing or unexpected:
+                print(f"  ! --allow-inexact-load: {len(missing)} missing and "
+                      f"{len(unexpected)} unexpected keys accepted; the "
+                      "forecasts are not fully this checkpoint's")
+        else:
+            recorder.assert_clean(adapter.name, adapter.checkpoint)
     load_seconds = time.perf_counter() - t_load
     print(f"    loaded in {load_seconds:.1f}s")
 
@@ -1654,6 +1936,7 @@ def run_model(adapter: Adapter, bars: pd.DataFrame, walk_forward: PurgedWalkForw
             **adapter.provenance(),
             "forecasts_per_fold": fold_rows,
             "folds_skipped_because_present": skipped_existing,
+            "input_series": getattr(adapter, "series", None),
             "partial": True,
             "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         })
@@ -1682,6 +1965,7 @@ def run_model(adapter: Adapter, bars: pd.DataFrame, walk_forward: PurgedWalkForw
         **adapter.provenance(),
         "forecasts_per_fold": fold_rows,
         "folds_skipped_because_present": skipped_existing,
+        "input_series": getattr(adapter, "series", None),
         "partial": False,
         "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     })
@@ -1987,6 +2271,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", default="forecasts")
     p.add_argument("--timings", default="results/timings.json")
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--allow-inexact-load", action="store_true",
+                   help="proceed when load_state_dict reports missing or "
+                        "unexpected keys. Off by default: an inexact load "
+                        "leaves parameters at their constructor initialisation "
+                        "and the forecasts are then not the checkpoint's. Use "
+                        "only for a mismatch you have inspected and decided is "
+                        "benign - it is recorded in the run log either way")
     p.add_argument("--calibrate", action="store_true",
                    help="Kronos CRPS and wall-clock vs sample_count on one fold")
     p.add_argument("--calib-sample-counts", nargs="+", type=int,

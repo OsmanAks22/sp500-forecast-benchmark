@@ -659,6 +659,219 @@ def test_the_timing_payload_would_carry_provenance_fields():
         assert field in prov
 
 
+# --------------------------------------------------------------------------
+# 8. merging against a record written before forecasts_per_fold existed
+# --------------------------------------------------------------------------
+
+def _legacy_record(**over):
+    """A prior written before forecasts_per_fold was added - no row attribution."""
+    rec = _full_record()
+    rec.pop("forecasts_per_fold")
+    rec.update(over)
+    return rec
+
+
+def test_a_legacy_prior_does_not_have_its_total_overwritten_by_one_fold():
+    """Re-measuring one fold must not write 12,650 over 83,450."""
+    partial = _full_record(n_folds=1, n_forecasts=12650,
+                           seconds_per_fold={"0": 30.0},
+                           forecasts_per_fold={"0": 12650},
+                           seconds_steady_state_total=30.0)
+    merged = runner._merge_timing(_legacy_record(), partial)
+    assert merged["n_forecasts"] == 83450, "the completed total must stand"
+    assert merged["n_folds"] == 4
+    assert merged["n_forecasts_from_legacy_prior"] is True
+    assert "attributed per fold" in merged["n_forecasts_note"]
+
+
+def test_a_legacy_prior_still_gains_rows_from_a_genuinely_new_fold():
+    legacy = _legacy_record(seconds_per_fold={"0": 38.7, "1": 37.5},
+                            n_folds=2, n_forecasts=25250)
+    new = _full_record(n_folds=1, n_forecasts=12550,
+                       seconds_per_fold={"2": 40.0},
+                       forecasts_per_fold={"2": 12550})
+    merged = runner._merge_timing(legacy, new)
+    assert merged["n_forecasts"] == 25250 + 12550
+    assert merged["n_folds"] == 3
+
+
+def test_a_row_set_that_disagrees_with_the_fold_set_raises():
+    """A record that contradicts itself is worse than a failure."""
+    prior = _full_record(seconds_per_fold={"0": 1.0, "1": 2.0},
+                         forecasts_per_fold={"0": 10}, n_folds=2)
+    new = _full_record(seconds_per_fold={"2": 3.0},
+                       forecasts_per_fold={"2": 30}, n_folds=1)
+    with pytest.raises(ValueError, match="inconsistent"):
+        runner._merge_timing(prior, new)
+
+
+def test_a_different_input_series_forces_a_replace():
+    """Returns and prices are different questions, not different speeds."""
+    prior = _full_record(input_series="return")
+    other = _full_record(input_series="price", n_folds=1,
+                         seconds_per_fold={"0": 40.0},
+                         forecasts_per_fold={"0": 12650})
+    merged = runner._merge_timing(prior, other)
+    assert merged["replaced_prior_record"] is True
+    assert "input_series" in merged["replaced_because"]
+
+
+def test_input_series_is_part_of_run_identity():
+    assert "input_series" in runner.RUN_IDENTITY_FIELDS
+
+
+# --------------------------------------------------------------------------
+# 9. the checks that would have caught the TimesFM run
+# --------------------------------------------------------------------------
+
+TIMESFM_25_CONFIG = {
+    "architectures": ["TimesFmModelForPrediction"],
+    "quantiles": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+    "horizon_length": 128, "quantile_horizon_length": 1024,
+}
+
+
+def test_the_25_checkpoint_implies_ten_channels_not_nine():
+    """The whole bug in one assertion: 9 observed, 10 declared."""
+    adapter = _timesfm_adapter()
+    assert adapter.expected_channels(TIMESFM_25_CONFIG) == 10
+
+
+def test_a_three_point_zero_style_config_implies_one_channel_per_level():
+    config = {"architectures": ["TimesFM3Torch"],
+              "quantiles": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]}
+    assert _timesfm_adapter().expected_channels(config) == 9
+
+
+def test_a_channel_count_disagreeing_with_the_checkpoint_raises(monkeypatch):
+    adapter = _timesfm_adapter()
+    monkeypatch.setattr(runner, "_checkpoint_config", lambda repo: TIMESFM_25_CONFIG)
+    with pytest.raises(SystemExit, match="9 output channels"):
+        adapter.assert_channels_match_checkpoint(9)
+    adapter.assert_channels_match_checkpoint(10)        # must not raise
+
+
+def test_a_missing_checkpoint_config_skips_rather_than_guesses(monkeypatch):
+    adapter = _timesfm_adapter()
+    monkeypatch.setattr(runner, "_checkpoint_config", lambda repo: None)
+    adapter.assert_channels_match_checkpoint(9)         # must not raise
+
+
+def test_chronos_expects_its_own_twenty_one_levels():
+    adapter = runner.ChronosAdapter((0.1, 0.5, 0.9), 512, "cpu", 32)
+    config = {"chronos_config": {"quantiles": [0.01] * 21}}
+    assert adapter.expected_channels(config) == 21
+    assert adapter.expected_channels({}) is None
+
+
+class _FakeModule:
+    """Stands in for torch.nn.Module so the recorder can be exercised."""
+
+    def load_state_dict(self, state_dict, *a, **k):
+        return self._result
+
+
+def _fake_torch(result):
+    module_cls = type("Module", (), {"load_state_dict": _FakeModule.load_state_dict,
+                                     "_result": result})
+    return types.SimpleNamespace(nn=types.SimpleNamespace(Module=module_cls))
+
+
+def test_a_clean_load_passes_and_restores_the_method():
+    ok = types.SimpleNamespace(missing_keys=[], unexpected_keys=[])
+    torch = _fake_torch(ok)
+    original = torch.nn.Module.load_state_dict
+    rec = runner._StateDictLoadRecorder(torch)
+    with rec:
+        torch.nn.Module().load_state_dict({})
+    assert torch.nn.Module.load_state_dict is original
+    rec.assert_clean("Chronos-2", "amazon/chronos-2")    # must not raise
+
+
+def test_missing_or_unexpected_keys_fail_the_run():
+    bad = types.SimpleNamespace(missing_keys=["blk.0.w"], unexpected_keys=["enc.b"])
+    torch = _fake_torch(bad)
+    rec = runner._StateDictLoadRecorder(torch)
+    with rec:
+        torch.nn.Module().load_state_dict({})
+    with pytest.raises(SystemExit, match="did not load cleanly"):
+        rec.assert_clean("TimesFM-2.5", "google/timesfm-2.5-200m-pytorch")
+
+
+def test_the_recorder_restores_the_method_even_when_the_load_raises():
+    torch = _fake_torch(types.SimpleNamespace(missing_keys=[], unexpected_keys=[]))
+    original = torch.nn.Module.load_state_dict
+    with pytest.raises(RuntimeError):
+        with runner._StateDictLoadRecorder(torch):
+            raise RuntimeError("download failed")
+    assert torch.nn.Module.load_state_dict is original
+
+
+# --------------------------------------------------------------------------
+# 10. the scale guardrail, arm-aware
+# --------------------------------------------------------------------------
+
+def _levels_with_sigma(sigma, n=64):
+    """A frozen-grid block whose 80% interval implies the given sigma."""
+    grid = (0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99)
+    half = sigma * runner.Q90_Q10_TO_SIGMA / 2
+    row = np.zeros(len(grid))
+    row[grid.index(0.1)] = -half
+    row[grid.index(0.9)] = +half
+    return np.tile(row, (n, 1)), grid
+
+
+def _band_adapter(arm="return"):
+    adapter = runner.ChronosAdapter(
+        (0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99), 512, "cpu", 32)
+    adapter.arm = arm
+    return adapter
+
+
+def test_a_realistic_return_sigma_passes():
+    levels, _ = _levels_with_sigma(0.0157)              # Chronos-2, measured
+    _band_adapter().assert_sigma_in_band(levels)        # must not raise
+
+
+def test_the_timesfm_scale_would_have_been_rejected():
+    """0.0906/day = 144% annualised, the run that reached the parquet."""
+    levels, _ = _levels_with_sigma(0.0906)
+    with pytest.raises(SystemExit, match="outside the return-arm band"):
+        _band_adapter().assert_sigma_in_band(levels)
+
+
+def test_an_implausibly_tight_band_is_also_rejected():
+    levels, _ = _levels_with_sigma(0.0001)
+    with pytest.raises(SystemExit, match="outside the return-arm band"):
+        _band_adapter().assert_sigma_in_band(levels)
+
+
+def test_the_volatility_arm_has_its_own_band():
+    """A single global band would never fire on the volatility arm."""
+    ret_low, ret_high = runner.SIGMA_BANDS["return"]
+    vol_low, vol_high = runner.SIGMA_BANDS["volatility"]
+    assert (vol_low, vol_high) != (ret_low, ret_high)
+    # A spread plausible for the 21-session RV target but far too tight to be a
+    # daily return: passes on the volatility arm, fails on the return arm.
+    levels, _ = _levels_with_sigma(0.001)
+    _band_adapter("volatility").assert_sigma_in_band(levels)
+    with pytest.raises(SystemExit):
+        _band_adapter("return").assert_sigma_in_band(levels)
+
+
+def test_a_point_only_model_skips_the_band_rather_than_failing():
+    """TTM has no 80% interval; absence is not a scale error."""
+    levels, _ = _levels_with_sigma(0.02)
+    levels[:] = np.nan
+    _band_adapter().assert_sigma_in_band(levels)        # must not raise
+
+
+def test_implied_sigma_uses_the_normal_80_percent_span():
+    assert runner.Q90_Q10_TO_SIGMA == pytest.approx(2.5631, abs=1e-4)
+    assert runner.implied_daily_sigma(np.array([-1.28155]),
+                                      np.array([1.28155])) == pytest.approx(1.0, abs=1e-4)
+
+
 def test_the_proxy_matches_the_chunk_extent_not_the_full_sample_count():
     """The trap introduced by chunking.
 
