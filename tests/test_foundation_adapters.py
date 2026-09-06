@@ -778,13 +778,27 @@ def _fake_torch(result):
     return types.SimpleNamespace(nn=types.SimpleNamespace(Module=module_cls))
 
 
+def _checkpoint_shaped(n=40):
+    """A whole-network state dict: many keys, each addressing a submodule."""
+    return {f"encoder.blocks.{i}.attn.weight": None for i in range(n)}
+
+
+def _submodule_shaped():
+    """One small module loading itself: the entire key set, no paths.
+
+    This is what refused Chronos-2 and TTM - two libraries sharing no code,
+    both reporting missing ['bias', 'weight'].
+    """
+    return {}
+
+
 def test_a_clean_load_passes_and_restores_the_method():
     ok = types.SimpleNamespace(missing_keys=[], unexpected_keys=[])
     torch = _fake_torch(ok)
     original = torch.nn.Module.load_state_dict
     rec = runner._StateDictLoadRecorder(torch)
     with rec:
-        torch.nn.Module().load_state_dict({})
+        torch.nn.Module().load_state_dict(_checkpoint_shaped())
     assert torch.nn.Module.load_state_dict is original
     rec.assert_clean("Chronos-2", "amazon/chronos-2")    # must not raise
 
@@ -794,9 +808,78 @@ def test_missing_or_unexpected_keys_fail_the_run():
     torch = _fake_torch(bad)
     rec = runner._StateDictLoadRecorder(torch)
     with rec:
-        torch.nn.Module().load_state_dict({})
+        torch.nn.Module().load_state_dict(_checkpoint_shaped())
     with pytest.raises(SystemExit, match="did not load cleanly"):
         rec.assert_clean("TimesFM-2.5", "google/timesfm-2.5-200m-pytorch")
+
+
+def test_a_bare_key_submodule_load_is_not_the_checkpoint():
+    """The false positive, reproduced.
+
+    A small module loading itself reports missing ['bias', 'weight'] and says
+    nothing about the checkpoint. Both models it refused ran cleanly before the
+    guard existed and produced sound output.
+    """
+    bad = types.SimpleNamespace(missing_keys=["bias", "weight"], unexpected_keys=[])
+    torch = _fake_torch(bad)
+    rec = runner._StateDictLoadRecorder(torch)
+    with rec:
+        torch.nn.Module().load_state_dict(_submodule_shaped())
+    assert rec.principal_calls() == []
+    rec.assert_clean("Chronos-2", "amazon/chronos-2")    # must not raise
+
+
+def test_a_bad_submodule_load_beside_a_clean_checkpoint_load_passes():
+    """Exactly the Chronos-2 and TTM shape: noise beside a real, clean load."""
+    torch = _fake_torch(types.SimpleNamespace(missing_keys=[], unexpected_keys=[]))
+    rec = runner._StateDictLoadRecorder(torch)
+    with rec:
+        torch.nn.Module().load_state_dict(_checkpoint_shaped())
+    rec.calls.append({"module": "Linear", "n_incoming": 0, "dotted": False,
+                      "missing": ["bias", "weight"], "unexpected": []})
+    assert len(rec.principal_calls()) == 1
+    rec.assert_clean("TTM", "ibm-granite/granite-timeseries-ttm-r2")
+
+
+def test_a_bad_checkpoint_load_beside_submodule_noise_still_fails():
+    """Scoping must not become a way for a real failure to hide."""
+    torch = _fake_torch(types.SimpleNamespace(missing_keys=[], unexpected_keys=[]))
+    rec = runner._StateDictLoadRecorder(torch)
+    rec.calls.append({"module": "Linear", "n_incoming": 0, "dotted": False,
+                      "missing": ["bias", "weight"], "unexpected": []})
+    rec.calls.append({"module": "TimesFM3Torch", "n_incoming": 300, "dotted": True,
+                      "missing": ["stacked_xf.0.w"], "unexpected": ["blocks.0.w"]})
+    with pytest.raises(SystemExit, match="did not load cleanly"):
+        rec.assert_clean("TimesFM-2.5", "google/timesfm-2.5-200m-pytorch")
+
+
+def test_a_handful_of_dotted_keys_is_still_not_a_checkpoint():
+    """Both conditions are required, not either."""
+    torch = _fake_torch(types.SimpleNamespace(missing_keys=["a.b"], unexpected_keys=[]))
+    rec = runner._StateDictLoadRecorder(torch)
+    with rec:
+        torch.nn.Module().load_state_dict({"scaler.weight": None})
+    assert rec.principal_calls() == []
+    rec.assert_clean("TTM", "ibm-granite/granite-timeseries-ttm-r2")
+
+
+def test_no_load_state_dict_call_at_all_is_reported_not_passed_over(capsys):
+    """transformers 5.x never reaches this method; silence would read as proof."""
+    torch = _fake_torch(types.SimpleNamespace(missing_keys=[], unexpected_keys=[]))
+    rec = runner._StateDictLoadRecorder(torch)
+    rec.assert_clean("Chronos-2", "amazon/chronos-2")
+    out = capsys.readouterr().out
+    assert "not verifiable here" in out
+    assert "channel probe" in out
+
+
+def test_the_summary_names_each_call_and_its_key_shape():
+    torch = _fake_torch(types.SimpleNamespace(missing_keys=["bias"], unexpected_keys=[]))
+    rec = runner._StateDictLoadRecorder(torch)
+    with rec:
+        torch.nn.Module().load_state_dict({"weight": None})
+    summary = rec.summary()
+    assert "bare" in summary and "Module" in summary
 
 
 def test_the_recorder_restores_the_method_even_when_the_load_raises():

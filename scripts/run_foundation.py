@@ -320,6 +320,13 @@ def _checkpoint_config(repo_id: str | None) -> dict | None:
     return None
 
 
+# A checkpoint's state dict addresses tensors inside submodules, so its keys
+# carry module paths and there are many of them. A handful of bare names -
+# 'weight', 'bias' - is the entire key set of one small module loading itself,
+# which is a different event and says nothing about the checkpoint.
+PRINCIPAL_LOAD_MIN_KEYS = 8
+
+
 class _StateDictLoadRecorder:
     """Capture what ``load_state_dict`` reported, which the loaders discard.
 
@@ -333,22 +340,55 @@ class _StateDictLoadRecorder:
     and restored in ``finally``. Narrow and temporary, for the same reason the
     numpy proxy is: the blast radius of a patched framework method should be one
     call, not a process.
+
+    WHICH CALL IS THE CHECKPOINT'S
+    ------------------------------
+    Not every call to this method carries a checkpoint. Constructing a model
+    also loads small submodules that own their weights - a projection, a norm,
+    a scaler - and those legitimately have nothing in the checkpoint file. The
+    first version of this recorder asserted on all of them and refused two
+    checkpoints that were demonstrably fine, both reporting the same two missing
+    keys, ``bias`` and ``weight``, from libraries that share no code. Bare names
+    with no module path are the signature: a checkpoint's state dict addresses
+    tensors *inside* submodules, so its keys carry paths and there are many.
+
+    So a call is treated as principal only when its incoming state dict both
+    carries module paths and holds more than a handful of keys. Everything else
+    is recorded and printed, never asserted on.
+
+    AND SOMETIMES THERE IS NO SUCH CALL
+    -----------------------------------
+    Several loaders never reach this method at all. transformers 5.x populates
+    parameters through ``set_module_tensor_to_device`` and has no
+    ``load_state_dict`` call in ``modeling_utils`` whatsoever, which covers both
+    the Chronos-2 pipeline and TTM. When no principal load is observed this
+    reports that the load could not be verified *here* rather than passing
+    silently - the absence of evidence is itself worth printing, because it says
+    which other check is carrying the weight for that model.
     """
 
     def __init__(self, torch_module):
         self.torch = torch_module
-        self.results: list[tuple[list, list]] = []
+        self.calls: list[dict] = []
 
     def __enter__(self):
         real = self.torch.nn.Module.load_state_dict
         self._real = real
-        results = self.results
+        calls = self.calls
 
         def recording(module_self, state_dict, *args, **kwargs):
             out = real(module_self, state_dict, *args, **kwargs)
-            missing = list(getattr(out, "missing_keys", []) or [])
-            unexpected = list(getattr(out, "unexpected_keys", []) or [])
-            results.append((missing, unexpected))
+            try:
+                keys = list(state_dict.keys())
+            except AttributeError:                       # not a mapping
+                keys = []
+            calls.append({
+                "module": type(module_self).__name__,
+                "n_incoming": len(keys),
+                "dotted": any("." in str(k) for k in keys),
+                "missing": list(getattr(out, "missing_keys", []) or []),
+                "unexpected": list(getattr(out, "unexpected_keys", []) or []),
+            })
             return out
 
         self.torch.nn.Module.load_state_dict = recording
@@ -358,13 +398,39 @@ class _StateDictLoadRecorder:
         self.torch.nn.Module.load_state_dict = self._real
         return False
 
+    def principal_calls(self) -> list[dict]:
+        """The calls whose incoming state dict looks like a whole checkpoint."""
+        return [c for c in self.calls
+                if c["dotted"] and c["n_incoming"] >= PRINCIPAL_LOAD_MIN_KEYS]
+
+    def summary(self) -> str:
+        if not self.calls:
+            return "no load_state_dict calls"
+        parts = []
+        for c in self.calls:
+            shape = "paths" if c["dotted"] else "bare"
+            parts.append(f"{c['module']}({c['n_incoming']} {shape} keys, "
+                         f"-{len(c['missing'])}/+{len(c['unexpected'])})")
+        return "; ".join(parts)
+
     def assert_clean(self, model_name: str, checkpoint: str | None) -> None:
-        missing = sorted({k for m, _ in self.results for k in m})
-        unexpected = sorted({k for _, u in self.results for k in u})
+        principal = self.principal_calls()
+        if not principal:
+            print(f"    weights       {len(self.calls)} load_state_dict call(s), "
+                  "none checkpoint-shaped: " + self.summary())
+            print("                  this loader populates parameters without "
+                  "load_state_dict, so the")
+            print("                  weights are not verifiable here - the "
+                  "channel probe against the")
+            print("                  checkpoint's own config is what covers "
+                  "this model.")
+            return
+
+        missing = sorted({k for c in principal for k in c["missing"]})
+        unexpected = sorted({k for c in principal for k in c["unexpected"]})
         if not (missing or unexpected):
-            n = len(self.results)
-            print(f"    weights       {n} load_state_dict call(s), no missing or "
-                  "unexpected keys")
+            print(f"    weights       {len(principal)} checkpoint-shaped load(s) "
+                  f"of {len(self.calls)} total, no missing or unexpected keys")
             return
         raise SystemExit(
             f"{model_name}: the checkpoint did not load cleanly from "
@@ -373,6 +439,7 @@ class _StateDictLoadRecorder:
             f"{' ...' if len(missing) > 8 else ''}\n"
             f"  unexpected keys ({len(unexpected)}): {unexpected[:8]}"
             f"{' ...' if len(unexpected) > 8 else ''}\n"
+            f"  all calls: {self.summary()}\n"
             "  A non-strict load leaves the unmatched parameters at their\n"
             "  constructor initialisation, so the model runs and produces\n"
             "  forecasts that are not this checkpoint's. Refusing to continue.")
@@ -1964,8 +2031,9 @@ def run_model(adapter: Adapter, bars: pd.DataFrame, walk_forward: PurgedWalkForw
         with recorder:
             adapter.load()
         if args.allow_inexact_load:
-            missing = sorted({k for m, _ in recorder.results for k in m})
-            unexpected = sorted({k for _, u in recorder.results for k in u})
+            principal = recorder.principal_calls()
+            missing = sorted({k for c in principal for k in c["missing"]})
+            unexpected = sorted({k for c in principal for k in c["unexpected"]})
             if missing or unexpected:
                 print(f"  ! --allow-inexact-load: {len(missing)} missing and "
                       f"{len(unexpected)} unexpected keys accepted; the "
