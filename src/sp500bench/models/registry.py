@@ -98,6 +98,26 @@ REGISTRY: list[ModelSpec] = [
               "rediscover it.",
               {"checkpoint": "google/timesfm-2.5-200m-pytorch",
                "entry_point": "timesfm.TimesFM3Forecaster",
+               # Settled on the GPU, 6 September 2026. The entry point was
+               # right and the method was not: TimesFM3Forecaster exposes
+               # predict and predict_batch, and no forecast at all - forecast
+               # belongs to the TimesFM_2p5 base class, and calling it cost a
+               # Kaggle run. Recorded so the next one does not rediscover it.
+               "inference_method": "predict_batch",
+               # The checkpoint MUST be passed explicitly. _ModelConfig
+               # defaults checkpoint_path to google/timesfm-3.0-pytorch, so
+               # constructing the forecaster with no argument loads a
+               # different model generation whose output shape is close
+               # enough that nothing downstream would catch the substitution.
+               "checkpoint_must_be_explicit": True,
+               "checkpoint_library_default": "google/timesfm-3.0-pytorch",
+               # 9 channels, offset 0 - one per native level, no separate
+               # point channel. Verified on the GPU against the library's own
+               # returned point forecast rather than assumed: the package
+               # documents two layouts (a 10-channel head with the point
+               # forecast first, and this one) and choosing wrongly shifts
+               # every level by one while changing no shape.
+               "channel_layout": "9 channels, offset 0, median verified",
                "pretrain_cutoff": "undocumented"}),
     # EXCLUDED 5 September 2026, after the Kaggle smoke test and before any
     # result. The spec is kept rather than deleted: it was pre-registered, it
