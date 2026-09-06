@@ -13,6 +13,7 @@ Neither test needs a GPU or the kronos package.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -509,6 +510,153 @@ def test_an_unverified_fp16_run_says_so_in_grid_json():
         sample_count=100, precision="fp16", verification=None)
     note = adapter.grid_note()
     assert "NOT VERIFIED" in note["precision_verification"]
+
+
+# --------------------------------------------------------------------------
+# 6. a load-only call must not overwrite a completed run's timing
+# --------------------------------------------------------------------------
+
+def _full_record(**over):
+    rec = {"n_folds": 4, "n_forecasts": 83450, "partial": False,
+           "seconds_per_fold": {"0": 38.7, "1": 37.5, "2": 38.2, "3": 140.7},
+           "forecasts_per_fold": {"0": 12650, "1": 12600, "2": 12550, "3": 45650},
+           "seconds_steady_state_total": 255.1,
+           "context": 512, "device": "cuda", "sample_count": None,
+           "precision": None, "paths_per_call": None,
+           "checkpoint": "ibm-granite/granite-timeseries-ttm-r2",
+           "checkpoint_revision": "abc123", "recorded_at": "2026-09-06T10:00:00Z"}
+    rec.update(over)
+    return rec
+
+
+def _load_only_record(**over):
+    """What run_model writes when every fold already exists on disk."""
+    rec = _full_record(n_folds=0, n_forecasts=0, seconds_per_fold={},
+                       forecasts_per_fold={}, seconds_steady_state_total=0,
+                       recorded_at="2026-09-06T12:00:00Z")
+    rec.update(over)
+    return rec
+
+
+def test_a_load_only_call_does_not_erase_a_completed_record():
+    """The TTM regression: 4 folds and 83,450 forecasts became 0 and 0."""
+    merged = runner._merge_timing(_full_record(), _load_only_record())
+    assert merged["n_folds"] == 4
+    assert merged["n_forecasts"] == 83450
+    assert merged["seconds_steady_state_total"] == 255.1
+    assert merged["seconds_per_fold"]["3"] == 140.7
+    assert "executed no folds" in merged["last_invocation_note"]
+    assert merged["last_invocation_ran_no_folds_at"] == "2026-09-06T12:00:00Z"
+
+
+def test_a_load_only_call_on_an_empty_slot_still_records_the_absence():
+    merged = runner._merge_timing(None, _load_only_record())
+    assert merged["n_folds"] == 0
+    assert "last_invocation_note" not in merged
+
+
+def test_re_running_one_fold_updates_it_and_keeps_the_others():
+    partial = _full_record(n_folds=1, n_forecasts=12650,
+                           seconds_per_fold={"0": 30.0},
+                           forecasts_per_fold={"0": 12650},
+                           seconds_steady_state_total=30.0)
+    merged = runner._merge_timing(_full_record(), partial)
+    assert merged["seconds_per_fold"] == {"0": 30.0, "1": 37.5, "2": 38.2, "3": 140.7}
+    assert merged["n_folds"] == 4
+    assert merged["n_forecasts"] == 83450
+    assert merged["merged_with_prior_folds"] == ["1", "2", "3"]
+    assert merged["seconds_steady_state_total"] == pytest.approx(246.4)
+
+
+def test_a_run_under_different_settings_replaces_rather_than_merges():
+    """Per-fold times from another configuration are not the same measurement."""
+    other = _full_record(precision="fp16", n_folds=2, n_forecasts=25250,
+                         seconds_per_fold={"0": 9.0, "1": 9.1},
+                         forecasts_per_fold={"0": 12650, "1": 12600})
+    merged = runner._merge_timing(_full_record(precision="fp32"), other)
+    assert merged["replaced_prior_record"] is True
+    assert "precision" in merged["replaced_because"]
+    assert merged["seconds_per_fold"] == {"0": 9.0, "1": 9.1}
+
+
+def test_a_changed_checkpoint_revision_also_forces_a_replace():
+    """Same repo id, moved branch - not the same weights, not the same timing."""
+    other = _full_record(checkpoint_revision="def456", n_folds=1,
+                         seconds_per_fold={"0": 40.0},
+                         forecasts_per_fold={"0": 12650})
+    merged = runner._merge_timing(_full_record(checkpoint_revision="abc123"), other)
+    assert merged["replaced_prior_record"] is True
+    assert "checkpoint_revision" in merged["replaced_because"]
+
+
+def test_record_timing_on_disk_preserves_the_completed_run(tmp_path):
+    """End to end through the file, which is where the loss actually happened."""
+    path = tmp_path / "timings.json"
+    runner.record_timing(path, "TTM", _full_record())
+    runner.record_timing(path, "TTM", _load_only_record())
+    written = json.loads(path.read_text())["TTM"]
+    assert written["n_folds"] == 4 and written["n_forecasts"] == 83450
+
+
+def test_other_models_in_the_file_are_untouched(tmp_path):
+    path = tmp_path / "timings.json"
+    runner.record_timing(path, "Chronos-2", _full_record())
+    runner.record_timing(path, "TTM", _load_only_record())
+    written = json.loads(path.read_text())
+    assert written["Chronos-2"]["n_folds"] == 4
+    assert set(written) == {"Chronos-2", "TTM"}
+
+
+# --------------------------------------------------------------------------
+# 7. provenance: which weights, which code
+# --------------------------------------------------------------------------
+
+def test_every_adapter_declares_its_checkpoint():
+    for cls in (runner.ChronosAdapter, runner.TimesFMAdapter, runner.TTMAdapter,
+                runner.KronosAdapter):
+        assert cls.checkpoint, f"{cls.name} declares no checkpoint"
+
+
+def test_timesfm_declares_the_pinned_checkpoint_not_the_library_default():
+    assert runner.TimesFMAdapter.checkpoint == runner.TIMESFM_CHECKPOINT
+    assert "3.0" not in runner.TimesFMAdapter.checkpoint
+
+
+def test_a_revision_read_from_the_cache_is_reported_with_its_source(tmp_path,
+                                                                    monkeypatch):
+    repo = "amazon/chronos-2"
+    refs = tmp_path / ("models--" + repo.replace("/", "--")) / "refs"
+    refs.mkdir(parents=True)
+    (refs / "main").write_text("3f9c1a2b7d4e5f60718293a4b5c6d7e8f9012345\n")
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+    sha, source = runner._hf_cache_revision(repo)
+    assert sha == "3f9c1a2b7d4e5f60718293a4b5c6d7e8f9012345"
+    assert "hf cache" in source
+
+
+def test_a_missing_revision_is_distinguishable_from_one_nobody_looked_for():
+    """A null revision must say which kind of null it is."""
+    assert runner._hf_cache_revision("no/such-model")[1] == "not in the local hf cache"
+    assert runner._hf_cache_revision(None)[1] == "no checkpoint declared"
+
+
+def test_kronos_provenance_carries_both_checkpoints_and_the_clone():
+    adapter = runner.KronosAdapter(
+        our_grid=(0.1, 0.5, 0.9), context=512, device="cpu", batch=8,
+        sample_count=100, kronos_path=str(ROOT))
+    prov = adapter.provenance()
+    assert prov["checkpoint"] == "NeoQuasar/Kronos-small"
+    assert prov["tokenizer_checkpoint"] == "NeoQuasar/Kronos-Tokenizer-base"
+    assert prov["library"] == "kronos (git clone)"
+    # Cloned, not installed, so its version is the commit of the working copy.
+    assert prov["library_version"] and len(prov["library_version"]) == 40
+
+
+def test_the_timing_payload_would_carry_provenance_fields():
+    prov = runner.ChronosAdapter((0.1, 0.5, 0.9), 512, "cpu", 32).provenance()
+    for field in ("checkpoint", "checkpoint_revision", "library",
+                  "library_version"):
+        assert field in prov
 
 
 def test_the_proxy_matches_the_chunk_extent_not_the_full_sample_count():

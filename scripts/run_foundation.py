@@ -152,8 +152,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib.metadata
 import inspect
 import json
+import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -244,6 +247,135 @@ def show(path: Path) -> str:
 # timings
 # --------------------------------------------------------------------------
 
+def _distribution_version(dist: str | None) -> str | None:
+    if not dist:
+        return None
+    try:
+        return importlib.metadata.version(dist)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _hf_cache_revision(repo_id: str | None) -> tuple[str | None, str]:
+    """The commit the checkpoint was actually resolved to, from the local cache.
+
+    A repo id alone does not identify a checkpoint: ``main`` moves. Read from the
+    cache rather than the Hub so it works with the network off and so it reports
+    the commit this machine really has, not the one the Hub serves now.
+
+    Returns ``(sha, source)``; the source is recorded even when the sha is not
+    found, so a null revision is distinguishable from one nobody looked for.
+    """
+    if not repo_id:
+        return None, "no checkpoint declared"
+    roots = [os.environ.get("HF_HUB_CACHE"),
+             os.environ.get("HUGGINGFACE_HUB_CACHE"),
+             os.path.join(os.environ["HF_HOME"], "hub")
+             if os.environ.get("HF_HOME") else None,
+             os.path.expanduser("~/.cache/huggingface/hub")]
+    folder = "models--" + repo_id.replace("/", "--")
+    for root in roots:
+        if not root:
+            continue
+        refs = Path(root) / folder / "refs" / "main"
+        if refs.is_file():
+            try:
+                return refs.read_text().strip(), f"hf cache {refs}"
+            except OSError:
+                continue
+    return None, "not in the local hf cache"
+
+
+def _git_head(path: str | None) -> str | None:
+    """HEAD of a checked-out repository - Kronos ships as a clone, not a wheel."""
+    if not path or not Path(path).is_dir():
+        return None
+    try:
+        out = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() or None
+
+
+def _torch_version() -> str | None:
+    try:
+        import torch
+        return str(torch.__version__)
+    except Exception:                                  # pragma: no cover - no torch locally
+        return None
+
+
+# Fields that identify the run a timing belongs to. Per-fold times measured
+# under different settings are not the same measurement and must not be merged.
+RUN_IDENTITY_FIELDS = ("context", "device", "sample_count", "precision",
+                       "paths_per_call", "checkpoint", "checkpoint_revision")
+
+
+def _merge_timing(prior: dict | None, payload: dict) -> dict:
+    """Never let a call that measured less overwrite one that measured more.
+
+    A run whose folds already exist on disk skips every one of them, so it
+    reaches the end of ``run_model`` with an empty ``seconds_per_fold`` and
+    writes ``n_folds=0, n_forecasts=0`` over a complete record. That is how the
+    TTM entry came to claim nothing had run while 83,450 forecasts sat in
+    ``forecasts/TTM/``: the loss is silent, and the number it leaves behind
+    looks like a measurement rather than an absence.
+
+    Three cases:
+
+    * nothing measured now, something measured before - keep the prior record
+      whole and note that a later invocation ran no folds;
+    * something measured now under the same settings - merge per fold, so
+      re-running one fold updates that fold and leaves the others standing;
+    * something measured now under different settings - replace, because the
+      old per-fold times describe a different configuration, and say so.
+    """
+    if prior is None:
+        return payload
+
+    measured_now = dict(payload.get("seconds_per_fold") or {})
+    measured_before = dict(prior.get("seconds_per_fold") or {})
+
+    if not measured_now and measured_before:
+        kept = dict(prior)
+        kept["last_invocation_ran_no_folds_at"] = payload.get("recorded_at")
+        kept["last_invocation_note"] = (
+            "a later run loaded the model but executed no folds - every fold "
+            "already existed on disk and --overwrite was not passed. The timing "
+            "below is from the run that produced the forecasts.")
+        return kept
+
+    identity_now = {k: payload.get(k) for k in RUN_IDENTITY_FIELDS}
+    identity_before = {k: prior.get(k) for k in RUN_IDENTITY_FIELDS}
+    if measured_before and identity_now != identity_before:
+        changed = [k for k in RUN_IDENTITY_FIELDS
+                   if identity_now.get(k) != identity_before.get(k)]
+        merged = dict(payload)
+        merged["replaced_prior_record"] = True
+        merged["replaced_because"] = (
+            f"run identity changed ({', '.join(changed)}); the previous "
+            "per-fold times measured a different configuration and were not "
+            "merged into these")
+        return merged
+
+    merged_folds = {**measured_before, **measured_now}
+    merged_rows = {**(prior.get("forecasts_per_fold") or {}),
+                   **(payload.get("forecasts_per_fold") or {})}
+    out = dict(payload)
+    out["seconds_per_fold"] = merged_folds
+    out["forecasts_per_fold"] = merged_rows
+    out["n_folds"] = len(merged_folds)
+    out["n_forecasts"] = sum(merged_rows.values()) if merged_rows else payload.get("n_forecasts", 0)
+    total = sum(merged_folds.values())
+    out["seconds_steady_state_total"] = round(total, 3)
+    out["seconds_steady_state_mean"] = (round(total / len(merged_folds), 3)
+                                        if merged_folds else None)
+    if set(measured_now) != set(merged_folds):
+        out["merged_with_prior_folds"] = sorted(set(merged_folds) - set(measured_now))
+    return out
+
+
 def record_timing(path: Path, model: str, payload: dict) -> None:
     """Merge one model's wall-clock into results/timings.json.
 
@@ -259,7 +391,12 @@ def record_timing(path: Path, model: str, payload: dict) -> None:
             existing = json.loads(path.read_text())
         except json.JSONDecodeError:
             print(f"  ! {path} is not valid JSON; starting a fresh record")
-    existing[model] = payload
+    merged = _merge_timing(existing.get(model), payload)
+    if merged.get("last_invocation_note"):
+        print(f"  timings: kept the existing {model} record "
+              f"({merged.get('n_folds')} folds, {merged.get('n_forecasts', 0):,} "
+              "forecasts) - this invocation ran no folds")
+    existing[model] = merged
     path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n")
 
 
@@ -400,6 +537,12 @@ class Adapter:
     name: str
     series = "return"
     needs_bars = False
+    # Which checkpoint, and which distribution provides the code that runs it.
+    # Recorded per run: a repo id does not identify a checkpoint on its own,
+    # because the branch it resolves to moves, and a forecast whose provenance
+    # is only "the model name" cannot be reproduced or audited later.
+    checkpoint: str | None = None
+    distribution: str | None = None
 
     def __init__(self, our_grid, context: int, device: str, batch: int):
         self.our_grid = tuple(our_grid)
@@ -413,6 +556,18 @@ class Adapter:
     def predict(self, contexts: np.ndarray) -> tuple[np.ndarray, dict]:
         raise NotImplementedError
 
+    def provenance(self) -> dict:
+        """Exactly which weights and which code produced this run."""
+        revision, source = _hf_cache_revision(self.checkpoint)
+        return {
+            "checkpoint": self.checkpoint,
+            "checkpoint_revision": revision,
+            "checkpoint_revision_source": source,
+            "library": self.distribution,
+            "library_version": _distribution_version(self.distribution),
+            "torch_version": _torch_version(),
+        }
+
     def grid_note(self) -> dict:
         return {"model": self.name, "scored_on_frozen_grid": True,
                 "native_levels": list(self.our_grid), "notes": ""}
@@ -420,6 +575,8 @@ class Adapter:
 
 class ChronosAdapter(Adapter):
     name = "Chronos-2"
+    checkpoint = "amazon/chronos-2"
+    distribution = "chronos-forecasting"
 
     def load(self) -> None:
         import torch
@@ -462,6 +619,8 @@ class ChronosAdapter(Adapter):
 
 class TimesFMAdapter(Adapter):
     name = "TimesFM-2.5"
+    checkpoint = TIMESFM_CHECKPOINT
+    distribution = "timesfm"
 
     def load(self) -> None:
         import timesfm
@@ -676,6 +835,8 @@ class TimesFMAdapter(Adapter):
 
 class TTMAdapter(Adapter):
     name = "TTM"
+    checkpoint = "ibm-granite/granite-timeseries-ttm-r2"
+    distribution = "granite-tsfm"
 
     def load(self) -> None:
         import torch
@@ -894,6 +1055,9 @@ def _assert_kronos_signature(kronos_module) -> None:
 
 class KronosAdapter(Adapter):
     name = "Kronos-small"
+    checkpoint = "NeoQuasar/Kronos-small"
+    tokenizer_checkpoint = "NeoQuasar/Kronos-Tokenizer-base"
+    distribution = None          # a git clone, not a wheel; see provenance()
     series = "price"
     needs_bars = True
 
@@ -1208,6 +1372,22 @@ class KronosAdapter(Adapter):
         levels = np.quantile(returns, self.our_grid, axis=1).T   # (n, len(our_grid))
         return levels, {}
 
+    def provenance(self) -> dict:
+        """Two checkpoints and a clone, so three things identify this run."""
+        base = super().provenance()
+        tok_rev, tok_source = _hf_cache_revision(self.tokenizer_checkpoint)
+        base.update({
+            "tokenizer_checkpoint": self.tokenizer_checkpoint,
+            "tokenizer_revision": tok_rev,
+            "tokenizer_revision_source": tok_source,
+            # Kronos is cloned, not installed, so the commit of the working
+            # copy is its version - there is no distribution to ask.
+            "library": "kronos (git clone)",
+            "library_version": _git_head(self.kronos_path),
+            "library_source": self.kronos_path,
+        })
+        return base
+
     def grid_note(self) -> dict:
         return {
             "model": self.name, "scored_on_frozen_grid": True,
@@ -1425,6 +1605,8 @@ def run_model(adapter: Adapter, bars: pd.DataFrame, walk_forward: PurgedWalkForw
         json.dumps(adapter.grid_note(), indent=2) + "\n")
 
     fold_times: dict[str, float] = {}
+    fold_rows: dict[str, int] = {}
+    skipped_existing: list[int] = []
     rows_written = 0
     started = time.perf_counter()
 
@@ -1433,6 +1615,7 @@ def run_model(adapter: Adapter, bars: pd.DataFrame, walk_forward: PurgedWalkForw
         if path.exists() and not args.overwrite:
             print(f"  fold {split.fold}  exists, skipping ({show(path)}) "
                   "- pass --overwrite to redo")
+            skipped_existing.append(int(split.fold))
             continue
 
         # Zero-shot: nothing is fitted, so the purge gap does not bound the
@@ -1451,6 +1634,7 @@ def run_model(adapter: Adapter, bars: pd.DataFrame, walk_forward: PurgedWalkForw
         # hour nine should cost the current fold, not the run.
         forecasts.to_parquet(path, index=False)
         fold_times[str(split.fold)] = round(elapsed, 3)
+        fold_rows[str(split.fold)] = len(forecasts)
         rows_written += len(forecasts)
         record_timing(timings_path, adapter.name, {
             "library": "foundation", "tier": "foundation", "scope": "zero_shot",
@@ -1467,6 +1651,9 @@ def run_model(adapter: Adapter, bars: pd.DataFrame, walk_forward: PurgedWalkForw
             "precision_verification": getattr(adapter, "verification", None),
             "peak_gpu_gib": (adapter.peak_memory_gib()
                              if hasattr(adapter, "peak_memory_gib") else None),
+            **adapter.provenance(),
+            "forecasts_per_fold": fold_rows,
+            "folds_skipped_because_present": skipped_existing,
             "partial": True,
             "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         })
@@ -1492,6 +1679,9 @@ def run_model(adapter: Adapter, bars: pd.DataFrame, walk_forward: PurgedWalkForw
         "precision_verification": getattr(adapter, "verification", None),
         "peak_gpu_gib": (adapter.peak_memory_gib()
                          if hasattr(adapter, "peak_memory_gib") else None),
+        **adapter.provenance(),
+        "forecasts_per_fold": fold_rows,
+        "folds_skipped_because_present": skipped_existing,
         "partial": False,
         "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     })
