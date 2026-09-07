@@ -869,17 +869,47 @@ def test_no_load_state_dict_call_at_all_is_reported_not_passed_over(capsys):
     rec = runner._StateDictLoadRecorder(torch)
     rec.assert_clean("Chronos-2", "amazon/chronos-2")
     out = capsys.readouterr().out
-    assert "not verifiable here" in out
+    assert "verifiable here" in out
     assert "channel probe" in out
+    assert "none checkpoint-shaped" in out
 
 
-def test_the_summary_names_each_call_and_its_key_shape():
-    torch = _fake_torch(types.SimpleNamespace(missing_keys=["bias"], unexpected_keys=[]))
+def test_the_summary_groups_by_module_type_rather_than_listing_every_call():
+    """Chronos-2 makes 170 of these calls and TTM 134; across nineteen models a
+    per-call listing buries anything real."""
+    torch = _fake_torch(types.SimpleNamespace(missing_keys=[], unexpected_keys=[]))
     rec = runner._StateDictLoadRecorder(torch)
-    with rec:
-        torch.nn.Module().load_state_dict({"weight": None})
+    rec.calls = ([{"module": "T5LayerNorm", "n_incoming": 1, "dotted": False,
+                   "missing": [], "unexpected": []} for _ in range(120)]
+                 + [{"module": "Linear", "n_incoming": 2, "dotted": False,
+                     "missing": [], "unexpected": []} for _ in range(48)]
+                 + [{"module": "Embedding", "n_incoming": 1, "dotted": False,
+                     "missing": [], "unexpected": []} for _ in range(2)])
     summary = rec.summary()
-    assert "bare" in summary and "Module" in summary
+    assert summary == "170 calls: T5LayerNorm x120, Linear x48, Embedding x2"
+    assert summary.count("\n") == 0, "the readable form is one line"
+    assert len(summary) < 100
+
+
+def test_the_per_call_detail_is_available_but_capped():
+    torch = _fake_torch(types.SimpleNamespace(missing_keys=[], unexpected_keys=[]))
+    rec = runner._StateDictLoadRecorder(torch)
+    rec.calls = [{"module": "Linear", "n_incoming": 2, "dotted": False,
+                  "missing": [], "unexpected": []} for _ in range(170)]
+    detail = rec.detail()
+    assert len(detail) == 21, "20 lines plus an elision"
+    assert "and 150 more" in detail[-1]
+
+
+def test_the_clean_line_is_one_line_even_with_many_calls(capsys):
+    torch = _fake_torch(types.SimpleNamespace(missing_keys=[], unexpected_keys=[]))
+    rec = runner._StateDictLoadRecorder(torch)
+    rec.calls = [{"module": "T5LayerNorm", "n_incoming": 1, "dotted": False,
+                  "missing": [], "unexpected": []} for _ in range(170)]
+    rec.assert_clean("Chronos-2", "amazon/chronos-2")
+    out = capsys.readouterr().out
+    assert "T5LayerNorm x170" in out
+    assert out.count("T5LayerNorm") == 1, "grouped, not repeated per call"
 
 
 def test_the_recorder_restores_the_method_even_when_the_load_raises():
@@ -1081,6 +1111,90 @@ def test_grid_note_records_the_entry_point_and_the_verified_layout():
     assert note["entry_point"] == "timesfm.TimesFM_2p5_200M_torch"
     assert note["channel_layout_offset"] == 1
     assert "not hardcoded" in note["channel_layout_verified_against"]
+
+
+# --------------------------------------------------------------------------
+# 12. the artefact must record what the model actually emits
+# --------------------------------------------------------------------------
+
+def test_a_native_grid_wider_than_the_frozen_one_is_recorded_as_its_own():
+    """Chronos-2's file listed the frozen nine and lost the finding."""
+    adapter = runner.ChronosAdapter(
+        (0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99), 512, "cpu", 32)
+    # The real grid from amazon/chronos-2's chronos_config.quantiles.
+    adapter.native = [0.01, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45,
+                      0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 0.99]
+    note = adapter.grid_note()
+    assert len(note["native_levels"]) == 21
+    assert note["frozen_levels"] == list(adapter.our_grid)
+    assert note["native_matches_frozen"] is False
+    assert note["frozen_levels_direct"] == list(adapter.our_grid)
+    assert note["frozen_levels_interpolated"] == []
+    assert note["frozen_levels_unavailable"] == []
+    assert "21 levels of its own" in note["notes"]
+    assert "no interpolation anywhere" in note["notes"]
+    assert note["notes"] != ""
+
+
+def test_chronos_keeps_its_axis_order_finding_in_the_artefact():
+    adapter = runner.ChronosAdapter((0.1, 0.5, 0.9), 512, "cpu", 32)
+    adapter.native = [0.1, 0.2, 0.5, 0.8, 0.9]
+    assert "axis 1" in adapter.grid_note()["notes"]
+
+
+def test_a_model_whose_native_grid_is_the_frozen_one_says_so():
+    adapter = runner.ChronosAdapter((0.1, 0.5, 0.9), 512, "cpu", 32)
+    adapter.native = [0.1, 0.5, 0.9]
+    note = adapter.grid_note()
+    assert note["native_matches_frozen"] is True
+    assert note["native_levels"] == note["frozen_levels"]
+
+
+def test_an_adapter_that_never_set_native_falls_back_to_the_frozen_grid():
+    adapter = runner.ChronosAdapter((0.1, 0.5, 0.9), 512, "cpu", 32)
+    note = adapter.grid_note()
+    assert note["native_levels"] == [0.1, 0.5, 0.9]
+    assert note["native_matches_frozen"] is True
+
+
+def test_the_resolved_layout_offset_is_written_back(tmp_path):
+    """The file claimed the layout was verified and carried no value for it."""
+    path = tmp_path / "grid.json"
+    adapter = _timesfm_adapter()
+    adapter.native = list(runner.TIMESFM_NATIVE_GRID)
+    adapter.direct, adapter.interpolated = [0.1, 0.5, 0.9], [0.25, 0.75]
+    adapter.unavailable = [0.01, 0.05, 0.95, 0.99]
+
+    # Written before the first fold: the offset is not known yet.
+    runner.write_grid_note(path, adapter.grid_note())
+    assert json.loads(path.read_text())["channel_layout_offset"] is None
+
+    # Resolved on the first batch, then written again.
+    adapter.channel_layout = 1
+    runner.write_grid_note(path, adapter.grid_note())
+    assert json.loads(path.read_text())["channel_layout_offset"] == 1
+
+
+def test_a_later_pass_cannot_null_out_a_resolved_value(tmp_path):
+    """A load-only rerun must not undo what a real run established."""
+    path = tmp_path / "grid.json"
+    adapter = _timesfm_adapter()
+    adapter.native = list(runner.TIMESFM_NATIVE_GRID)
+    adapter.direct, adapter.interpolated, adapter.unavailable = [0.1], [0.25], [0.01]
+
+    adapter.channel_layout = 1
+    runner.write_grid_note(path, adapter.grid_note())
+    adapter.channel_layout = None                 # a fresh adapter, nothing run
+    runner.write_grid_note(path, adapter.grid_note())
+    assert json.loads(path.read_text())["channel_layout_offset"] == 1
+
+
+def test_write_grid_note_survives_a_corrupt_existing_file(tmp_path):
+    path = tmp_path / "grid.json"
+    path.write_text("{not json")
+    adapter = runner.ChronosAdapter((0.1, 0.5, 0.9), 512, "cpu", 32)
+    runner.write_grid_note(path, adapter.grid_note())
+    assert json.loads(path.read_text())["model"] == "Chronos-2"
 
 
 def test_the_proxy_matches_the_chunk_extent_not_the_full_sample_count():

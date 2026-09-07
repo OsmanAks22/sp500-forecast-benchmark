@@ -404,34 +404,54 @@ class _StateDictLoadRecorder:
                 if c["dotted"] and c["n_incoming"] >= PRINCIPAL_LOAD_MIN_KEYS]
 
     def summary(self) -> str:
+        """One line, grouped by module type.
+
+        Chronos-2 makes 170 of these calls and TTM 134; across nineteen models
+        a per-call listing is thousands of lines of noise that hides anything
+        real. The grouping is the readable form and the per-call detail is kept
+        for :meth:`detail`, which is printed only when something is missing.
+        """
         if not self.calls:
             return "no load_state_dict calls"
-        parts = []
-        for c in self.calls:
-            shape = "paths" if c["dotted"] else "bare"
-            parts.append(f"{c['module']}({c['n_incoming']} {shape} keys, "
-                         f"-{len(c['missing'])}/+{len(c['unexpected'])})")
-        return "; ".join(parts)
+        by_module: dict[str, int] = {}
+        for call in self.calls:
+            by_module[call["module"]] = by_module.get(call["module"], 0) + 1
+        parts = [f"{name} x{n}" if n > 1 else name
+                 for name, n in sorted(by_module.items(),
+                                       key=lambda kv: (-kv[1], kv[0]))]
+        return f"{len(self.calls)} calls: " + ", ".join(parts)
+
+    def detail(self, limit: int = 20) -> list[str]:
+        """Per-call lines, for a failure that needs the individual calls."""
+        lines = []
+        for call in self.calls[:limit]:
+            shape = "paths" if call["dotted"] else "bare"
+            lines.append(f"      {call['module']}({call['n_incoming']} {shape} "
+                         f"keys, -{len(call['missing'])}/"
+                         f"+{len(call['unexpected'])})")
+        if len(self.calls) > limit:
+            lines.append(f"      ... and {len(self.calls) - limit} more")
+        return lines
 
     def assert_clean(self, model_name: str, checkpoint: str | None) -> None:
         principal = self.principal_calls()
         if not principal:
-            print(f"    weights       {len(self.calls)} load_state_dict call(s), "
-                  "none checkpoint-shaped: " + self.summary())
-            print("                  this loader populates parameters without "
-                  "load_state_dict, so the")
-            print("                  weights are not verifiable here - the "
-                  "channel probe against the")
-            print("                  checkpoint's own config is what covers "
-                  "this model.")
+            print(f"    weights       none checkpoint-shaped ({self.summary()}); "
+                  "this loader places")
+            print("                  parameters without load_state_dict, so the "
+                  "weights are not")
+            print("                  verifiable here - the channel probe against "
+                  "the checkpoint's")
+            print("                  own config is what covers this model.")
             return
 
         missing = sorted({k for c in principal for k in c["missing"]})
         unexpected = sorted({k for c in principal for k in c["unexpected"]})
         if not (missing or unexpected):
             print(f"    weights       {len(principal)} checkpoint-shaped load(s) "
-                  f"of {len(self.calls)} total, no missing or unexpected keys")
+                  f"clean ({self.summary()})")
             return
+        # Only here is the per-call listing worth its space.
         raise SystemExit(
             f"{model_name}: the checkpoint did not load cleanly from "
             f"{checkpoint!r}.\n"
@@ -439,7 +459,7 @@ class _StateDictLoadRecorder:
             f"{' ...' if len(missing) > 8 else ''}\n"
             f"  unexpected keys ({len(unexpected)}): {unexpected[:8]}"
             f"{' ...' if len(unexpected) > 8 else ''}\n"
-            f"  all calls: {self.summary()}\n"
+            f"  {self.summary()}\n" + "\n".join(self.detail()) + "\n"
             "  A non-strict load leaves the unmatched parameters at their\n"
             "  constructor initialisation, so the model runs and produces\n"
             "  forecasts that are not this checkpoint's. Refusing to continue.")
@@ -606,6 +626,31 @@ def _merge_timing(prior: dict | None, payload: dict) -> dict:
     if set(measured_now) != set(merged_folds):
         out["merged_with_prior_folds"] = sorted(set(merged_folds) - set(measured_now))
     return out
+
+
+def write_grid_note(path: Path, note: dict) -> None:
+    """Write the grid note, never replacing a resolved value with a null.
+
+    The note is written once before the first fold so it exists if the run
+    dies, and again after each fold once values that can only be known by
+    running - the channel layout offset, resolved on the first batch - have
+    been settled. Without the merge the second write would be fine but a later
+    load-only invocation would put the nulls back, which is the same failure
+    the timing record already had: a file that claims a thing was verified and
+    carries no value for it.
+    """
+    existing: dict = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            existing = {}
+    merged = dict(existing)
+    for key, value in note.items():
+        if value is None and existing.get(key) is not None:
+            continue
+        merged[key] = value
+    path.write_text(json.dumps(merged, indent=2) + "\n")
 
 
 def record_timing(path: Path, model: str, payload: dict) -> None:
@@ -881,8 +926,54 @@ class Adapter:
         }
 
     def grid_note(self) -> dict:
-        return {"model": self.name, "scored_on_frozen_grid": True,
-                "native_levels": list(self.our_grid), "notes": ""}
+        """The model's own grid, and how the frozen one is recovered from it.
+
+        ``native_levels`` is what the *model* emits, which is not always the
+        frozen grid even when the model can be scored on it. Chronos-2 carries
+        twenty-one levels of which our nine happen to be exact members; writing
+        our nine into that field lost the finding and made the artefact claim
+        the model emits a grid it does not have. A model whose native grid and
+        frozen grid coincide records the same list twice, which is correct and
+        says so.
+        """
+        native = list(getattr(self, "native", None) or self.our_grid)
+        frozen = list(self.our_grid)
+        same = (len(native) == len(frozen)
+                and np.allclose(native, frozen, atol=1e-12))
+
+        note = {
+            "model": self.name,
+            "scored_on_frozen_grid": True,
+            "native_levels": native,
+            "frozen_levels": frozen,
+            "native_matches_frozen": bool(same),
+            "notes": "",
+        }
+        if same:
+            return note
+
+        exact = [q for q in frozen
+                 if any(np.isclose(q, g, atol=1e-12) for g in native)]
+        interior = [q for q in frozen
+                    if q not in exact and min(native) < q < max(native)]
+        outside = [q for q in frozen if q < min(native) or q > max(native)]
+        note["frozen_levels_direct"] = exact
+        note["frozen_levels_interpolated"] = interior
+        note["frozen_levels_unavailable"] = outside
+        if len(exact) == len(frozen):
+            note["notes"] = (
+                f"{self.name} emits {len(native)} levels of its own, "
+                f"{native}. All {len(frozen)} frozen levels are exact members "
+                "of that set, so they are selected by value with no "
+                "interpolation anywhere and the model is directly comparable on "
+                "CRPS to models scored on the frozen grid.")
+        else:
+            note["notes"] = (
+                f"{self.name} emits {len(native)} levels of its own, "
+                f"{native}. Of the frozen {len(frozen)}: {exact} are exact "
+                f"members, {interior} are interpolated inside its support, and "
+                f"{outside} lie outside it.")
+        return note
 
 
 class ChronosAdapter(Adapter):
@@ -909,6 +1000,19 @@ class ChronosAdapter(Adapter):
     def expected_channels(self, config: dict) -> int | None:
         levels = (config.get("chronos_config") or {}).get("quantiles")
         return len(levels) if levels else None
+
+    def grid_note(self) -> dict:
+        note = super().grid_note()
+        note["notes"] += (
+            " The quantile axis is axis 1 of a (n_variates, n_quantiles, "
+            "prediction_length) return, per the pipeline's own documentation. "
+            "The base class documents the opposite order for a different "
+            "method, and at horizon 1 a transposed array is still the right "
+            "rank and still indexes without complaint, so the levels are "
+            "selected by value and the recovered set is compared against the "
+            "frozen grid element for element rather than trusted to index "
+            "arithmetic.")
+        return note
 
     def predict(self, contexts: np.ndarray) -> tuple[np.ndarray, dict]:
         n = len(contexts)
@@ -2051,8 +2155,8 @@ def run_model(adapter: Adapter, bars: pd.DataFrame, walk_forward: PurgedWalkForw
         adapter._channels_checked = True
     print(f"    loaded in {load_seconds:.1f}s")
 
-    (model_dir / "grid.json").write_text(
-        json.dumps(adapter.grid_note(), indent=2) + "\n")
+    grid_path = model_dir / "grid.json"
+    write_grid_note(grid_path, adapter.grid_note())
 
     fold_times: dict[str, float] = {}
     fold_rows: dict[str, int] = {}
@@ -2108,6 +2212,9 @@ def run_model(adapter: Adapter, bars: pd.DataFrame, walk_forward: PurgedWalkForw
             "partial": True,
             "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         })
+        # The layout offset is only known after a batch has run, so the note
+        # written before the first fold carries a null for it.
+        write_grid_note(grid_path, adapter.grid_note())
         print(f"  fold {split.fold}  test=[{split.test_start.date()} .. "
               f"{split.test_end.date()}]  {len(forecasts):>6,} forecasts  "
               f"{elapsed:8.1f}s  {show(path)}")
