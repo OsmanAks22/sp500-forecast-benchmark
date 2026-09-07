@@ -243,12 +243,33 @@ def _histories(panel: pd.DataFrame, id_col: str, time_col: str,
     Small either way, but the loop runs 1,669 times per model and there is no
     reason to scan five thousand rows to find the last sixty.
     """
-    out = {}
+    out, trimmed = {}, 0
     for ticker, group in panel.groupby(id_col, sort=True):
         frame = (group[[id_col, time_col, target_col]]
                  .sort_values(time_col).reset_index(drop=True))
+        finite = np.isfinite(frame[target_col].to_numpy(dtype=float))
+        if not finite.all():
+            if not finite.any():
+                raise ValueError(f"{ticker}: no finite target anywhere in the panel")
+            last_good = int(np.max(np.flatnonzero(finite)))
+            # Only the trailing run is dropped. The last session of the panel
+            # has no target by construction - make_target is log(P[t+1]/P[t])
+            # and there is no t+1 - and neuralforecast refuses a frame holding
+            # NaN in y. A NaN anywhere before that is a data defect, not a
+            # boundary, and dropping it globally would hide it.
+            if not finite[:last_good + 1].all():
+                gaps = frame.loc[~np.isfinite(
+                    frame[target_col].to_numpy(dtype=float))][time_col]
+                interior = [d for d in gaps if d <= frame[time_col].iloc[last_good]]
+                raise ValueError(
+                    f"{ticker}: target is NaN at {len(interior)} session(s) "
+                    f"inside the series, first at {pd.Timestamp(interior[0]).date()}. "
+                    "That is a data defect rather than the end-of-panel "
+                    "boundary, and it is not dropped silently.")
+            trimmed += len(frame) - (last_good + 1)
+            frame = frame.iloc[:last_good + 1].reset_index(drop=True)
         out[ticker] = (frame, pd.DatetimeIndex(frame[time_col]))
-    return out
+    return out, trimmed
 
 
 def neural_forecast_fold(
@@ -293,20 +314,38 @@ def neural_forecast_fold(
     nf = NeuralForecast(models=[model], freq="B")
     nf.fit(df=fit_frame, val_size=runtime.val_size)
 
-    histories = _histories(panel, id_col, time_col, target_col)
+    histories, trimmed = _histories(panel, id_col, time_col, target_col)
     calendar = pd.DatetimeIndex(sorted(panel[time_col].unique()))
-    origins = calendar[(calendar >= pd.Timestamp(test_start))
-                       & (calendar <= pd.Timestamp(test_end))]
+    in_window = calendar[(calendar >= pd.Timestamp(test_start))
+                         & (calendar <= pd.Timestamp(test_end))]
+
+    # An origin whose own label is NaN has no outcome to be scored against, and
+    # evaluate.py refuses a forecast with none. The foundation runner drops the
+    # same origin for the same reason; both tiers must forecast the same set or
+    # they are not comparable.
+    labelled = pd.DatetimeIndex(sorted(
+        pd.unique(panel.loc[np.isfinite(panel[target_col].to_numpy(dtype=float)),
+                            time_col])))
+    origins = in_window.intersection(labelled)
+    dropped = len(in_window) - len(origins)
+    if dropped or trimmed:
+        print(f"      {model_name}: {dropped} origin(s) with no forward return "
+              f"skipped, {trimmed} trailing NaN row(s) trimmed from the history")
 
     rows = []
+    width = runtime.input_size + horizon
     for origin in origins:
         blocks = []
-        width = runtime.input_size + horizon
         for ticker, (frame, index) in histories.items():
-            # Context runs to the origin inclusive and no further: the label at
-            # the origin is the forward return, which is what we are predicting.
-            # side="right" makes the origin itself the last row included.
-            stop = int(index.searchsorted(origin, side="right"))
+            # The context ends at the session BEFORE the origin.
+            #
+            # y[t] is the target, log(P[t+1]/P[t]), which is not known at t: the
+            # last target known at the origin is y[t-1]. Including y[t] would put
+            # the value being predicted into the model's own input, and the
+            # one-step-ahead forecast would then be of y[t+1] while carrying
+            # ds = t - scored against y[t], which the model had just been shown.
+            # side="left" excludes the origin row; side="right" would include it.
+            stop = int(index.searchsorted(origin, side="left"))
             if stop < width:
                 continue
             block = frame.iloc[stop - width:stop]

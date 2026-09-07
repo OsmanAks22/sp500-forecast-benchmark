@@ -174,28 +174,104 @@ def test_the_error_names_what_it_looked_for():
     assert "DLinear-lo-90.0" in str(excinfo.value)
 
 
-def test_the_context_slice_ends_at_the_origin_inclusive():
-    """Positional slicing must land where the mask did: the origin is the last
-    row in, and the label at the origin is what is being predicted."""
+def test_the_context_stops_before_the_origin():
+    """The label must not be in the model's own input.
+
+    y[t] is log(P[t+1]/P[t]) and is not known at t; the last target known at the
+    origin is y[t-1]. Including y[t] would show the model the value it is about
+    to be scored on, and the one-step forecast would be of y[t+1] while carrying
+    ds = t."""
     dates = pd.bdate_range("2020-01-01", periods=200)
     panel = pd.DataFrame({"unique_id": "AAA", "ds": dates,
                           "y": np.arange(len(dates), dtype=float)})
-    histories = neural._histories(panel, "unique_id", "ds", "y")
+    histories, _ = neural._histories(panel, "unique_id", "ds", "y")
     frame, index = histories["AAA"]
     origin = dates[150]
-    stop = int(index.searchsorted(origin, side="right"))
+    stop = int(index.searchsorted(origin, side="left"))
     block = frame.iloc[stop - 61:stop]
-    assert block["ds"].iloc[-1] == origin, "the origin must be the last row in"
+    assert block["ds"].iloc[-1] == dates[149], "the context must stop before the origin"
     assert len(block) == 61
-    assert block["y"].iloc[-1] == 150.0
+    assert block["y"].iloc[-1] == 149.0
+    assert origin not in set(block["ds"]), "the label session must not be in the input"
 
 
 def test_an_origin_with_too_little_history_is_skipped_not_padded():
     dates = pd.bdate_range("2020-01-01", periods=40)
     panel = pd.DataFrame({"unique_id": "AAA", "ds": dates, "y": 0.0})
-    frame, index = neural._histories(panel, "unique_id", "ds", "y")["AAA"]
-    stop = int(index.searchsorted(dates[-1], side="right"))
+    frame, index = neural._histories(panel, "unique_id", "ds", "y")[0]["AAA"]
+    stop = int(index.searchsorted(dates[-1], side="left"))
     assert stop < 61, "40 sessions cannot fill a 61-row window"
+
+
+def test_a_trailing_nan_target_is_trimmed_from_the_history():
+    """The panel's last session has no target by construction.
+
+    make_target is log(P[t+1]/P[t]) and there is no t+1, so the final row is
+    NaN. neuralforecast refuses a frame holding NaN in y, which is what stopped
+    fold 3.
+    """
+    dates = pd.bdate_range("2020-01-01", periods=50)
+    y = np.arange(50, dtype=float)
+    y[-1] = np.nan
+    panel = pd.DataFrame({"unique_id": "AAA", "ds": dates, "y": y})
+    histories, trimmed = neural._histories(panel, "unique_id", "ds", "y")
+    frame, index = histories["AAA"]
+    assert trimmed == 1
+    assert len(frame) == 49
+    assert np.isfinite(frame["y"].to_numpy()).all()
+    assert index[-1] == dates[-2]
+
+
+def test_an_interior_nan_is_a_data_defect_and_still_fails():
+    """Dropping NaN globally would hide it; only the trailing run is boundary."""
+    dates = pd.bdate_range("2020-01-01", periods=50)
+    y = np.arange(50, dtype=float)
+    y[20] = np.nan
+    panel = pd.DataFrame({"unique_id": "AAA", "ds": dates, "y": y})
+    with pytest.raises(ValueError, match="inside the series"):
+        neural._histories(panel, "unique_id", "ds", "y")
+
+
+def test_a_trailing_run_of_nans_is_trimmed_whole():
+    dates = pd.bdate_range("2020-01-01", periods=50)
+    y = np.arange(50, dtype=float)
+    y[-3:] = np.nan
+    panel = pd.DataFrame({"unique_id": "AAA", "ds": dates, "y": y})
+    _, trimmed = neural._histories(panel, "unique_id", "ds", "y")
+    assert trimmed == 3
+
+
+def test_a_series_with_no_finite_target_is_an_error():
+    dates = pd.bdate_range("2020-01-01", periods=10)
+    panel = pd.DataFrame({"unique_id": "AAA", "ds": dates, "y": np.nan})
+    with pytest.raises(ValueError, match="no finite target"):
+        neural._histories(panel, "unique_id", "ds", "y")
+
+
+def test_the_origin_count_matches_the_foundation_tier():
+    """Both tiers must forecast the same set or they are not comparable.
+
+    The foundation tier writes 83,450 rows over the test period: 50 tickers by
+    1,669 sessions, the 1,670 in the windows less the final one whose label does
+    not exist. Fold 3 contributes 913 of those, which is also what the
+    statsforecast driver documents.
+    """
+    features = pd.read_parquet(ROOT / "data" / "features.parquet",
+                               columns=["unique_id", "ds", "target"])
+    windows = load_configs().test_windows
+    calendar = pd.DatetimeIndex(sorted(pd.unique(features["ds"])))
+    labelled = pd.DatetimeIndex(sorted(pd.unique(
+        features.loc[np.isfinite(features["target"].to_numpy(dtype=float)), "ds"])))
+
+    per_fold = []
+    for start, end in windows:
+        in_window = calendar[(calendar >= pd.Timestamp(start))
+                             & (calendar <= pd.Timestamp(end))]
+        per_fold.append(len(in_window.intersection(labelled)))
+
+    assert per_fold == [253, 252, 251, 913]
+    assert sum(per_fold) == 1669
+    assert sum(per_fold) * 50 == 83450
 
 
 def test_the_output_is_mapped_onto_the_frozen_column_names():
