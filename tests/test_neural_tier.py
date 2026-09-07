@@ -105,17 +105,97 @@ def test_the_error_names_both_grids():
 # 3. mapping the library's output back onto the frozen columns
 # --------------------------------------------------------------------------
 
-def test_a_level_is_located_across_output_spellings():
+# The columns neuralforecast actually emitted on Colab, T4, DLinear with the
+# frozen nine. Named by symmetric interval, not by level.
+COLAB_COLUMNS = ["DLinear-hi-50.0", "DLinear-hi-80.0", "DLinear-hi-90.0",
+                 "DLinear-hi-98.0", "DLinear-lo-50.0", "DLinear-lo-80.0",
+                 "DLinear-lo-90.0", "DLinear-lo-98.0", "DLinear-median",
+                 "ds", "unique_id"]
+
+MEASURED_MAPPING = {0.01: "DLinear-lo-98.0", 0.05: "DLinear-lo-90.0",
+                    0.1: "DLinear-lo-80.0", 0.25: "DLinear-lo-50.0",
+                    0.5: "DLinear-median", 0.75: "DLinear-hi-50.0",
+                    0.9: "DLinear-hi-80.0", 0.95: "DLinear-hi-90.0",
+                    0.99: "DLinear-hi-98.0"}
+
+
+def test_the_interval_name_is_derived_not_tabulated():
+    """100*(1-2q) below the median, 100*(2q-1) above, median in the middle."""
+    for level, expected in MEASURED_MAPPING.items():
+        assert neural.interval_column_names("DLinear", level)[0] == expected
+
+
+def test_every_frozen_level_resolves_to_a_distinct_real_column():
+    """Against the columns the library actually produced on the GPU."""
+    resolved = {q: neural._find_level_column(COLAB_COLUMNS, "DLinear", q, FROZEN)
+                for q in FROZEN}
+    assert resolved == MEASURED_MAPPING
+    assert len(set(resolved.values())) == 9, "two levels must not share a column"
+
+
+def test_a_level_and_its_reflection_share_a_width_but_not_a_column():
+    """The lo/hi prefix is the only thing telling them apart."""
+    low = neural.interval_column_names("DLinear", 0.01)[0]
+    high = neural.interval_column_names("DLinear", 0.99)[0]
+    assert low.endswith("98.0") and high.endswith("98.0")
+    assert low != high and "-lo-" in low and "-hi-" in high
+
+
+def test_the_older_spellings_still_resolve():
     for column in ("DLinear-ql0.05", "DLinear-q-0.05", "DLinear-q0.05"):
-        assert neural._find_level_column([ "unique_id", "ds", column],
+        assert neural._find_level_column(["unique_id", "ds", column],
                                          "DLinear", 0.05) == column
 
 
 def test_a_missing_level_raises_rather_than_producing_a_nan_column():
     """The whole point of the grid gate: a gap must not reach the parquet."""
     with pytest.raises(KeyError, match="no output column for quantile level"):
-        neural._find_level_column(["unique_id", "ds", "DLinear-ql0.5"],
-                                  "DLinear", 0.01)
+        neural._find_level_column(["unique_id", "ds", "DLinear-median"],
+                                  "DLinear", 0.01, FROZEN)
+
+
+def test_an_asymmetric_grid_fails_and_says_why():
+    """This naming cannot express one; it must break rather than guess.
+
+    0.01 without 0.99 still produces a lo-98.0 column, so nothing about the
+    output marks the absence - the failure has to come from the mapping.
+    """
+    asymmetric = [0.01, 0.5, 0.9]
+    assert neural._is_symmetric(asymmetric) is False
+    assert neural._is_symmetric(FROZEN) is True
+    with pytest.raises(KeyError, match="NOT symmetric about 0.5"):
+        neural._find_level_column(["unique_id", "ds", "DLinear-median"],
+                                  "DLinear", 0.9, asymmetric)
+
+
+def test_the_error_names_what_it_looked_for():
+    with pytest.raises(KeyError) as excinfo:
+        neural._find_level_column(["unique_id", "ds"], "DLinear", 0.05, FROZEN)
+    assert "DLinear-lo-90.0" in str(excinfo.value)
+
+
+def test_the_context_slice_ends_at_the_origin_inclusive():
+    """Positional slicing must land where the mask did: the origin is the last
+    row in, and the label at the origin is what is being predicted."""
+    dates = pd.bdate_range("2020-01-01", periods=200)
+    panel = pd.DataFrame({"unique_id": "AAA", "ds": dates,
+                          "y": np.arange(len(dates), dtype=float)})
+    histories = neural._histories(panel, "unique_id", "ds", "y")
+    frame, index = histories["AAA"]
+    origin = dates[150]
+    stop = int(index.searchsorted(origin, side="right"))
+    block = frame.iloc[stop - 61:stop]
+    assert block["ds"].iloc[-1] == origin, "the origin must be the last row in"
+    assert len(block) == 61
+    assert block["y"].iloc[-1] == 150.0
+
+
+def test_an_origin_with_too_little_history_is_skipped_not_padded():
+    dates = pd.bdate_range("2020-01-01", periods=40)
+    panel = pd.DataFrame({"unique_id": "AAA", "ds": dates, "y": 0.0})
+    frame, index = neural._histories(panel, "unique_id", "ds", "y")["AAA"]
+    stop = int(index.searchsorted(dates[-1], side="right"))
+    assert stop < 61, "40 sessions cannot fill a 61-row window"
 
 
 def test_the_output_is_mapped_onto_the_frozen_column_names():
