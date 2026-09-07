@@ -65,13 +65,32 @@ tier_3_foundation:
   - name: TimesFM-2.5
     lib: timesfm
     checkpoint: google/timesfm-2.5-200m-pytorch
-    entry_point: timesfm.TimesFM3Forecaster
+    entry_point: timesfm.TimesFM_2p5_200M_torch
+    entry_point_superseded: timesfm.TimesFM3Forecaster
+    inference_method: forecast
+    inference_method_superseded: predict_batch
+    requires_compile: true
+    checkpoint_must_be_explicit: true
+    checkpoint_library_default: google/timesfm-3.0-pytorch
+    channel_layout: "10 channels, offset 1, median verified"
+    channel_layout_superseded: "9 channels, offset 0"
     mode: zero_shot
     pretrain_cutoff: undocumented
-    note: "Decoder-only, patch-based, continuous quantile head. Entry point is
-           TimesFM3Forecaster, not TimesFm - the latter does not exist in the
-           installed release. Confirmed on Kaggle 2 September 2026; the module
-           namespace also carries TimesFM3Torch and TimesFM_2p5_200M_torch."
+    note: "Decoder-only, patch-based. CORRECTED 6 September 2026 after the first
+           run of this spec produced invalid forecasts. TimesFM3Forecaster is the
+           3.0 wrapper: it builds a TimesFM3Torch from this checkpoint's own
+           config.json, of whose keys exactly one - quantiles - is also a
+           TimesFM3Torch constructor argument, so every other architecture field
+           was dropped, the model was built at 3.0 defaults, and the 2.5 weights
+           had nowhere to land. The run completed without error and every
+           assertion in the adapter passed, including the layout resolver, which
+           verifies the median channel against the library's own point forecast -
+           both came from the same unloaded network and agreed perfectly. The
+           only signal was magnitude: a median of +2.45%/day against a realised
+           +0.03%, and 144% implied annualised volatility against a realised 29%.
+           The correct class is TimesFM_2p5_200M_torch, whose own DEFAULT_REPO_ID
+           is this checkpoint; compile() is mandatory before forecast(), which
+           returns a (point, quantiles) tuple with 10 channels, offset 1."
   # EXCLUDED 5 September 2026, after the Kaggle smoke test and before any result.
   # The spec stays here deliberately: it was pre-registered, it was attempted,
   # and it was excluded for a documented environmental reason. A model that
