@@ -172,10 +172,14 @@ from sp500bench.config import (load_configs, load_data_config,  # noqa: E402
                                quantile_column, quantile_columns)
 from sp500bench.evaluation.splits import (PurgedWalkForward,  # noqa: E402
                                           assert_no_overlap)
+from sp500bench.evaluation.timings import (RUN_IDENTITY_FIELDS,  # noqa: E402,F401
+                                           merge_timing, record_timing)
 from sp500bench.evaluation.scale import (Q90_Q10_TO_SIGMA,  # noqa: E402,F401
                                          SIGMA_BANDS, SigmaOutOfBand,
                                          check_sigma_band, implied_daily_sigma)
 from sp500bench.models.registry import BY_NAME  # noqa: E402
+
+_merge_timing = merge_timing   # tests reach for this name
 
 FOUNDATION_MODELS = ["Chronos-2", "TimesFM-2.5", "TTM", "Kronos-small"]
 
@@ -493,108 +497,88 @@ def _torch_version() -> str | None:
         return None
 
 
-# Fields that identify the run a timing belongs to. Per-fold times measured
-# under different settings are not the same measurement and must not be merged.
-RUN_IDENTITY_FIELDS = ("context", "device", "sample_count", "precision",
-                       "paths_per_call", "checkpoint", "checkpoint_revision",
-                       # What the generic TSFMs were fed - returns or prices -
-                       # is a documented decision of this runner and changes
-                       # what the model was asked to do, not merely how fast it
-                       # did it. Folds measured under different input series
-                       # are different measurements.
-                       "input_series")
+def write_grid_note(path: Path, note: dict) -> None:
+    """Write the grid note, never replacing a resolved value with a null.
 
-
-def _merge_timing(prior: dict | None, payload: dict) -> dict:
-    """Never let a call that measured less overwrite one that measured more.
-
-    A run whose folds already exist on disk skips every one of them, so it
-    reaches the end of ``run_model`` with an empty ``seconds_per_fold`` and
-    writes ``n_folds=0, n_forecasts=0`` over a complete record. That is how the
-    TTM entry came to claim nothing had run while 83,450 forecasts sat in
-    ``forecasts/TTM/``: the loss is silent, and the number it leaves behind
-    looks like a measurement rather than an absence.
-
-    Three cases:
-
-    * nothing measured now, something measured before - keep the prior record
-      whole and note that a later invocation ran no folds;
-    * something measured now under the same settings - merge per fold, so
-      re-running one fold updates that fold and leaves the others standing;
-    * something measured now under different settings - replace, because the
-      old per-fold times describe a different configuration, and say so.
+    The note is written once before the first fold so it exists if the run
+    dies, and again after each fold once values that can only be known by
+    running - the channel layout offset, resolved on the first batch - have
+    been settled. Without the merge the second write would be fine but a later
+    load-only invocation would put the nulls back, which is the same failure
+    the timing record already had: a file that claims a thing was verified and
+    carries no value for it.
     """
-    if prior is None:
-        return payload
+    existing: dict = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            existing = {}
+    merged = dict(existing)
+    for key, value in note.items():
+        if value is None and existing.get(key) is not None:
+            continue
+        merged[key] = value
+    path.write_text(json.dumps(merged, indent=2) + "\n")
 
-    measured_now = dict(payload.get("seconds_per_fold") or {})
-    measured_before = dict(prior.get("seconds_per_fold") or {})
 
-    if not measured_now and measured_before:
-        kept = dict(prior)
-        kept["last_invocation_ran_no_folds_at"] = payload.get("recorded_at")
-        kept["last_invocation_note"] = (
-            "a later run loaded the model but executed no folds - every fold "
-            "already existed on disk and --overwrite was not passed. The timing "
-            "below is from the run that produced the forecasts.")
-        return kept
+def _distribution_version(dist: str | None) -> str | None:
+    if not dist:
+        return None
+    try:
+        return importlib.metadata.version(dist)
+    except importlib.metadata.PackageNotFoundError:
+        return None
 
-    identity_now = {k: payload.get(k) for k in RUN_IDENTITY_FIELDS}
-    identity_before = {k: prior.get(k) for k in RUN_IDENTITY_FIELDS}
-    if measured_before and identity_now != identity_before:
-        changed = [k for k in RUN_IDENTITY_FIELDS
-                   if identity_now.get(k) != identity_before.get(k)]
-        merged = dict(payload)
-        merged["replaced_prior_record"] = True
-        merged["replaced_because"] = (
-            f"run identity changed ({', '.join(changed)}); the previous "
-            "per-fold times measured a different configuration and were not "
-            "merged into these")
-        return merged
 
-    merged_folds = {**measured_before, **measured_now}
-    prior_rows = prior.get("forecasts_per_fold") or {}
-    payload_rows = payload.get("forecasts_per_fold") or {}
+def _hf_cache_revision(repo_id: str | None) -> tuple[str | None, str]:
+    """The commit the checkpoint was actually resolved to, from the local cache.
 
-    out = dict(payload)
-    out["seconds_per_fold"] = merged_folds
-    out["n_folds"] = len(merged_folds)
+    A repo id alone does not identify a checkpoint: ``main`` moves. Read from the
+    cache rather than the Hub so it works with the network off and so it reports
+    the commit this machine really has, not the one the Hub serves now.
 
-    if prior_rows or not measured_before:
-        # Both sides attribute rows per fold, so the total is recomputable.
-        merged_rows = {**prior_rows, **payload_rows}
-        if set(merged_rows) != set(merged_folds):
-            raise ValueError(
-                f"timing merge is inconsistent: folds {sorted(merged_folds)} "
-                f"have times but {sorted(merged_rows)} have row counts. "
-                "Writing a total over a fold set that does not match the "
-                "timed set produces a record that contradicts itself, which "
-                "is worse than failing here.")
-        out["forecasts_per_fold"] = merged_rows
-        out["n_forecasts"] = sum(merged_rows.values())
-    else:
-        # The prior predates forecasts_per_fold, so its rows cannot be split by
-        # fold and summing only the new fold would write that fold's count over
-        # the whole run's - 12,650 over 83,450, with nothing saying so.
-        # Re-measuring a fold does not change how many rows it produced, so the
-        # prior total stands; only genuinely new folds add to it.
-        new_folds = set(payload_rows) - set(measured_before)
-        out["forecasts_per_fold"] = payload_rows
-        out["n_forecasts"] = (int(prior.get("n_forecasts", 0))
-                              + sum(payload_rows[f] for f in new_folds))
-        out["n_forecasts_from_legacy_prior"] = True
-        out["n_forecasts_note"] = (
-            "the prior record predates forecasts_per_fold, so rows could not "
-            "be attributed per fold; the prior total was carried forward and "
-            "only folds it did not contain were added to it")
+    Returns ``(sha, source)``; the source is recorded even when the sha is not
+    found, so a null revision is distinguishable from one nobody looked for.
+    """
+    if not repo_id:
+        return None, "no checkpoint declared"
+    roots = [os.environ.get("HF_HUB_CACHE"),
+             os.environ.get("HUGGINGFACE_HUB_CACHE"),
+             os.path.join(os.environ["HF_HOME"], "hub")
+             if os.environ.get("HF_HOME") else None,
+             os.path.expanduser("~/.cache/huggingface/hub")]
+    folder = "models--" + repo_id.replace("/", "--")
+    for root in roots:
+        if not root:
+            continue
+        refs = Path(root) / folder / "refs" / "main"
+        if refs.is_file():
+            try:
+                return refs.read_text().strip(), f"hf cache {refs}"
+            except OSError:
+                continue
+    return None, "not in the local hf cache"
 
-    total = sum(merged_folds.values())
-    out["seconds_steady_state_total"] = round(total, 3)
-    out["seconds_steady_state_mean"] = (round(total / len(merged_folds), 3)
-                                        if merged_folds else None)
-    if set(measured_now) != set(merged_folds):
-        out["merged_with_prior_folds"] = sorted(set(merged_folds) - set(measured_now))
-    return out
+
+def _git_head(path: str | None) -> str | None:
+    """HEAD of a checked-out repository - Kronos ships as a clone, not a wheel."""
+    if not path or not Path(path).is_dir():
+        return None
+    try:
+        out = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() or None
+
+
+def _torch_version() -> str | None:
+    try:
+        import torch
+        return str(torch.__version__)
+    except Exception:                                  # pragma: no cover - no torch locally
+        return None
 
 
 def write_grid_note(path: Path, note: dict) -> None:

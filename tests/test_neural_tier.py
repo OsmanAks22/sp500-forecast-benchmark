@@ -14,6 +14,8 @@ exactly that - present columns, monotone ordering, finite values, wrong width.
 from __future__ import annotations
 
 import importlib.util
+import inspect
+import json
 import sys
 from pathlib import Path
 
@@ -373,7 +375,60 @@ def test_an_unknown_arm_is_an_error_not_a_default():
 
 
 # --------------------------------------------------------------------------
-# 6. leakage: the fit must not reach the test window
+# 6. a load-only pass must not crash, and must not erase a measurement
+# --------------------------------------------------------------------------
+
+def test_the_summary_line_survives_a_run_that_measured_nothing():
+    """Re-running a model whose folds all exist divided by an empty fold count."""
+    source = inspect.getsource(experiment.run_model)
+    assert "if fold_times:" in source, "the division must be guarded"
+    assert "already present, nothing " in source, "and say what it actually did"
+
+
+def test_both_runners_share_one_timing_record_implementation():
+    """A guard in only one of two writers to the same file is not a guard."""
+    from sp500bench.evaluation import timings
+    assert experiment.record_timing is timings.record_timing
+
+
+def test_a_load_only_pass_keeps_the_record_of_the_run_that_did_the_work(tmp_path):
+    """The TTM shape, reproduced through run_experiment's writer this time."""
+    from sp500bench.evaluation.timings import record_timing
+    path = tmp_path / "timings.json"
+    real = {"n_folds": 4, "n_forecasts": 83450,
+            "seconds_per_fold": {"0": 61.4, "1": 39.6, "2": 41.2, "3": 78.8},
+            "forecasts_per_fold": {"0": 12650, "1": 12600, "2": 12550, "3": 45650},
+            "seconds_steady_state_total": 221.0, "device": "cuda",
+            "max_steps": 500, "input_size": 60, "num_workers": 4,
+            "input_series": "return"}
+    load_only = dict(real, n_folds=0, n_forecasts=0, seconds_per_fold={},
+                     forecasts_per_fold={}, seconds_steady_state_total=0,
+                     folds_skipped_because_present=[0, 1, 2, 3])
+    record_timing(path, "DLinear", real)
+    record_timing(path, "DLinear", load_only)
+    written = json.loads(path.read_text())["DLinear"]
+    assert written["n_folds"] == 4
+    assert written["n_forecasts"] == 83450
+    assert written["seconds_steady_state_total"] == 221.0
+    assert "executed no folds" in written["last_invocation_note"]
+
+
+def test_a_tier_2_fold_measured_under_other_settings_does_not_merge(tmp_path):
+    """A different lookback or step budget is a different measurement."""
+    from sp500bench.evaluation.timings import RUN_IDENTITY_FIELDS, merge_timing
+    for field in ("max_steps", "input_size", "num_workers", "device"):
+        assert field in RUN_IDENTITY_FIELDS
+    prior = {"n_folds": 4, "n_forecasts": 83450, "max_steps": 500,
+             "seconds_per_fold": {"0": 61.4}, "forecasts_per_fold": {"0": 12650}}
+    other = {"n_folds": 1, "n_forecasts": 12650, "max_steps": 2000,
+             "seconds_per_fold": {"0": 240.0}, "forecasts_per_fold": {"0": 12650}}
+    merged = merge_timing(prior, other)
+    assert merged["replaced_prior_record"] is True
+    assert "max_steps" in merged["replaced_because"]
+
+
+# --------------------------------------------------------------------------
+# 7. leakage: the fit must not reach the test window
 # --------------------------------------------------------------------------
 
 def test_a_training_frame_reaching_the_test_window_is_refused():

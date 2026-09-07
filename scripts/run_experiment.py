@@ -57,6 +57,7 @@ from sp500bench.models.baselines import (last_return_forecast_fold,  # noqa: E40
                                          zero_return_forecast_fold)
 from sp500bench.evaluation.scale import (SigmaOutOfBand,  # noqa: E402
                                          check_sigma_band)
+from sp500bench.evaluation.timings import record_timing  # noqa: E402
 from sp500bench.models import neural  # noqa: E402
 from sp500bench.models.statistical import (autoarima_forecast_fold,  # noqa: E402
                                            autoets_forecast_fold)
@@ -200,24 +201,6 @@ def partition(roster: list[ModelSpec]) -> tuple[list[ModelSpec], list[tuple[Mode
     return runnable, skipped
 
 
-def record_timing(path: Path, model: str, payload: dict) -> None:
-    """Merge one model's wall-clock into results/timings.json.
-
-    Merged rather than overwritten so tiers run on different days, on different
-    machines, accumulate into one file. Axis 5 of the evaluation is compute cost,
-    and it cannot be reconstructed after the fact.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    existing = {}
-    if path.exists():
-        try:
-            existing = json.loads(path.read_text())
-        except json.JSONDecodeError:
-            print(f"  ! {path} is not valid JSON; starting a fresh record")
-    existing[model] = payload
-    path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n")
-
-
 def run_model(
     spec: ModelSpec,
     panel: pd.DataFrame,
@@ -322,6 +305,12 @@ def run_model(
         "seconds_wall_clock_total": round(time.perf_counter() - started + warmup_seconds, 3),
         "n_forecasts": rows_written,
         "n_folds": len(fold_times),
+        "folds_skipped_because_present": skipped_existing,
+        "input_series": "return",
+        "max_steps": getattr(neural.RUNTIME, "max_steps", None) if spec.name in NEURAL_TIER else None,
+        "input_size": getattr(neural.RUNTIME, "input_size", None) if spec.name in NEURAL_TIER else None,
+        "num_workers": getattr(neural.RUNTIME, "num_workers", None) if spec.name in NEURAL_TIER else None,
+        "device": getattr(neural.RUNTIME, "device", None) if spec.name in NEURAL_TIER else None,
         "warmup_note": (
             "seconds_warmup is one-off library JIT compilation, not model cost. It "
             "is charged to the first model that uses the library in a process; a "
@@ -330,9 +319,17 @@ def run_model(
         ),
         "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     })
-    print(f"  {rows_written:,} forecasts | steady state {steady:.2f}s "
-          f"({steady / len(fold_times):.2f}s/fold) | warm-up {warmup_seconds:.2f}s "
-          f"-> {show(timings_path)}")
+    if fold_times:
+        print(f"  {rows_written:,} forecasts | steady state {steady:.2f}s "
+              f"({steady / len(fold_times):.2f}s/fold) | warm-up "
+              f"{warmup_seconds:.2f}s -> {show(timings_path)}")
+    else:
+        # Every fold was already on disk, so nothing was measured. Dividing by
+        # the fold count crashed here; saying what actually happened is both
+        # correct and more useful than a zero.
+        print(f"  all {len(skipped_existing)} fold(s) already present, nothing "
+              f"run - pass --overwrite to redo. The timing record from the run "
+              f"that produced them is kept.")
 
 
 def main() -> None:
