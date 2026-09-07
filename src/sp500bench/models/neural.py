@@ -1,0 +1,383 @@
+"""Tier 2 - the supervised deep-learning generation, via neuralforecast.
+
+Seven models: DLinear and NLinear (Zeng et al.), LSTM and GRU, PatchTST, TFT and
+TimesNet. They are the generation the thesis question is about; without them the
+comparison is between two generations, not three.
+
+All seven are **global**: one model is fitted across all fifty series per fold,
+not one per ticker. That asymmetry against ARIMA and ETS is intrinsic to the
+architectures and is stated in the write-up - a global model sees fifty times
+the data - but it is also what makes seven models affordable here, because a
+fold costs one fit rather than fifty.
+
+
+WHAT THIS TIER COSTS A KAGGLE SESSION, LEARNED THE HARD WAY
+-----------------------------------------------------------
+Both of these cost a session already. They are recorded here rather than in the
+notebook so that whoever reads this file does not have to find the notebook.
+
+**Lightning cannot fork workers once CUDA is initialised.** Running this tier in
+a kernel that has already touched CUDA - the foundation smoke test does, twice -
+fails with::
+
+    RuntimeError: Lightning can't create new processes if CUDA is already
+    initialized
+
+So the neural tier belongs in its own Kaggle session, on a fresh kernel. Not a
+kernel restart: a session that has already imported and run a foundation model
+has an initialised CUDA context, and restarting the kernel does not clear what
+pip and the driver have already done. Start a new session and run this tier
+alone.
+
+**Dataloader settings go in ``dataloader_kwargs``, trainer settings go loose.**
+The first attempt passed ``num_workers_loader=0`` and got::
+
+    TypeError: Trainer.__init__() got an unexpected keyword argument
+    'num_workers_loader'
+
+because that parameter does not exist in neuralforecast. Anything the model
+constructor does not name falls into ``**trainer_kwargs`` and is handed straight
+to ``pl.Trainer``, which rejects it. The chain that works is::
+
+    DLinear(dataloader_kwargs={"num_workers": n})
+      -> BaseModel.dataloader_kwargs
+      -> TimeSeriesDataModule(**dataloader_kwargs)
+      -> the DataLoader
+
+while ``accelerator`` and ``devices`` legitimately travel through
+``**trainer_kwargs``. The smoke test used zero workers, which serialises data
+loading; that was a workaround for cell ordering and is wrong for seven models
+over fifty tickers and four folds. ``--num-workers`` exists so it can be lowered
+again if the image objects.
+
+
+HOW A FOLD IS FORECAST
+----------------------
+Fit once on the purged training frame, then roll.
+
+The models are fitted on ``train`` alone, which the walk-forward has already
+purged and embargoed, so nothing inside the gap or the test window reaches the
+optimiser. Forecasting is then a sequence of one-step-ahead predictions: for
+each test session ``t`` the history through ``t`` is handed to ``predict`` and
+the model returns ``t + 1`` for all fifty tickers at once.
+
+Rolling this way rather than through ``cross_validation`` is deliberate.
+``cross_validation`` decides internally where training stops, and this study's
+purge and embargo are not its default; passing the whole frame and trusting it
+to split correctly would put the gap sessions into the fit. Here the fit sees
+exactly ``train`` and nothing else, which is checkable by reading this file.
+
+Using sessions inside the gap as *context* for a prediction is not leakage - it
+is ordinary conditioning on the past, the same treatment the foundation tier's
+zero-shot models get. The constraint that matters is that the label at ``t`` is
+the forward return to ``t + 1``, so the context may run to ``t`` and no further.
+
+
+THE QUANTILE GRID
+-----------------
+Every model is trained with ``MQLoss`` on the frozen nine levels. MQLoss emits
+exactly the levels it was trained on, so a model trained on a different set
+cannot supply the missing columns and would surface as NaN in ``evaluate.py``
+long after the GPU hours were spent. :func:`assert_training_grid` gates that at
+construction instead, and the grid actually passed to the loss is printed with
+the run.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Sequence
+
+import numpy as np
+import pandas as pd
+
+from sp500bench.config import quantile_column
+
+__all__ = ["NEURAL_MODELS", "NeuralRuntime", "RUNTIME", "configure",
+           "assert_training_grid", "build_model", "neural_forecast_fold",
+           "make_executor", "executors"]
+
+# The seven specs in registry.py whose library is neuralforecast, mapped to the
+# class that implements each. Names must match the roster exactly.
+NEURAL_MODELS = {
+    "DLinear": "DLinear",
+    "NLinear": "NLinear",
+    "LSTM": "LSTM",
+    "GRU": "GRU",
+    "PatchTST": "PatchTST",
+    "TFT": "TFT",
+    "TimesNet": "TimesNet",
+}
+
+
+@dataclass
+class NeuralRuntime:
+    """Settings that come from the command line rather than the frozen spec.
+
+    Held here rather than threaded through the executor signature because every
+    other executor in the roster shares that signature and none of them has a
+    device. ``run_experiment`` sets this once, before any model runs, and prints
+    it - so it is configuration, not hidden state.
+    """
+
+    device: str = "auto"
+    num_workers: int = 4
+    max_steps: int = 500
+    input_size: int = 60
+    seed: int = 20260826
+    batch_size: int = 32
+    val_size: int = 0
+
+    @property
+    def accelerator(self) -> str:
+        if self.device in ("cuda", "gpu"):
+            return "gpu"
+        if self.device == "cpu":
+            return "cpu"
+        return "auto"
+
+    def trainer_kwargs(self) -> dict:
+        kwargs = {"accelerator": self.accelerator,
+                  "enable_progress_bar": False,
+                  "logger": False,
+                  "enable_checkpointing": False}
+        if self.accelerator == "gpu":
+            kwargs["devices"] = 1
+        return kwargs
+
+    def describe(self) -> str:
+        return (f"device={self.device} (accelerator={self.accelerator}) "
+                f"num_workers={self.num_workers} max_steps={self.max_steps} "
+                f"input_size={self.input_size} seed={self.seed}")
+
+
+RUNTIME = NeuralRuntime()
+
+
+def configure(**kwargs) -> NeuralRuntime:
+    """Set the runtime once, from parsed arguments."""
+    global RUNTIME
+    RUNTIME = NeuralRuntime(**{k: v for k, v in kwargs.items() if v is not None})
+    return RUNTIME
+
+
+def assert_training_grid(quantiles: Sequence[float], frozen: Sequence[float]) -> list[float]:
+    """The loss must be given the frozen grid, element for element, in order.
+
+    ``config.load_configs`` already gates the two halves of the specification
+    against each other. This extends the same gate to the executor, because the
+    configs agreeing with each other does not prove that what reached MQLoss was
+    either of them. A model trained on a subset emits only that subset, and the
+    missing columns arrive as NaN in ``evaluate.py`` - after the GPU hours.
+    """
+    levels = [float(q) for q in quantiles]
+    expected = [float(q) for q in frozen]
+    if levels != expected:
+        missing = sorted(set(expected) - set(levels))
+        extra = sorted(set(levels) - set(expected))
+        detail = ""
+        if missing:
+            detail += f"\n  levels scored but not trained: {missing}"
+        if extra:
+            detail += f"\n  levels trained but not scored: {extra}"
+        if not missing and not extra:
+            detail = "\n  same levels, different order - MQLoss emits them in the order given"
+        raise ValueError(
+            "the training grid handed to MQLoss is not the frozen grid.\n"
+            f"  passed to the loss : {levels}\n"
+            f"  configs/eval.yaml  : {expected}{detail}\n"
+            "  MQLoss emits exactly the levels it was trained on, so this would\n"
+            "  surface as NaN columns in evaluate.py rather than as an error.")
+    return levels
+
+
+def build_model(name: str, quantiles: Sequence[float], horizon: int,
+                runtime: NeuralRuntime | None = None):
+    """One neuralforecast model, with MQLoss on the frozen grid."""
+    from neuralforecast import models as nf_models
+    from neuralforecast.losses.pytorch import MQLoss
+
+    runtime = runtime or RUNTIME
+    if name not in NEURAL_MODELS:
+        raise KeyError(f"{name!r} is not a Tier 2 model; known: {sorted(NEURAL_MODELS)}")
+    cls = getattr(nf_models, NEURAL_MODELS[name], None)
+    if cls is None:
+        raise SystemExit(
+            f"neuralforecast has no model named {NEURAL_MODELS[name]!r}. "
+            f"Available: {sorted(n for n in dir(nf_models) if not n.startswith('_'))}")
+
+    levels = list(quantiles)
+    kwargs = dict(
+        h=horizon,
+        input_size=runtime.input_size,
+        loss=MQLoss(quantiles=levels),
+        max_steps=runtime.max_steps,
+        random_seed=runtime.seed,
+        batch_size=runtime.batch_size,
+        # Dataloader settings belong in this dict; trainer settings go loose.
+        # See the module docstring - the other way round costs a session.
+        dataloader_kwargs={"num_workers": runtime.num_workers},
+        **runtime.trainer_kwargs(),
+    )
+    return cls(**kwargs)
+
+
+def _histories(panel: pd.DataFrame, id_col: str, time_col: str,
+               target_col: str) -> dict[str, pd.DataFrame]:
+    """Per-ticker frames, sorted once, so rolling does not re-sort per origin."""
+    out = {}
+    for ticker, group in panel.groupby(id_col, sort=True):
+        frame = group[[id_col, time_col, target_col]].sort_values(time_col)
+        out[ticker] = frame.reset_index(drop=True)
+    return out
+
+
+def neural_forecast_fold(
+    model_name: str,
+    panel: pd.DataFrame,
+    train: pd.DataFrame,
+    test_start: pd.Timestamp,
+    test_end: pd.Timestamp,
+    quantiles: Sequence[float],
+    id_col: str = "unique_id",
+    time_col: str = "ds",
+    target_col: str = "y",
+    horizon: int = 1,
+    frozen_grid: Sequence[float] | None = None,
+    runtime: NeuralRuntime | None = None,
+    **_,
+) -> pd.DataFrame:
+    """Fit one global model on the purged training frame, then roll the window.
+
+    The grid gate and the leakage guard run before neuralforecast is imported,
+    deliberately. Both are statements about the protocol rather than about the
+    library, and a protocol violation should be reported as itself - not as a
+    missing package on a machine where the library happens to be absent, and not
+    after a model has already been constructed.
+    """
+    runtime = runtime or RUNTIME
+    levels = assert_training_grid(quantiles, frozen_grid or quantiles)
+    columns = [quantile_column(q) for q in levels]
+
+    fit_frame = train[[id_col, time_col, target_col]].rename(
+        columns={id_col: "unique_id", time_col: "ds", target_col: "y"})
+    train_end = pd.Timestamp(fit_frame["ds"].max())
+    if train_end >= pd.Timestamp(test_start):
+        raise AssertionError(
+            f"{model_name}: the training frame reaches {train_end.date()}, on or "
+            f"after the test window opens at {pd.Timestamp(test_start).date()}. "
+            "The fit would see the test period.")
+
+    from neuralforecast import NeuralForecast
+
+    model = build_model(model_name, levels, horizon, runtime)
+    nf = NeuralForecast(models=[model], freq="B")
+    nf.fit(df=fit_frame, val_size=runtime.val_size)
+
+    histories = _histories(panel, id_col, time_col, target_col)
+    calendar = pd.DatetimeIndex(sorted(panel[time_col].unique()))
+    origins = calendar[(calendar >= pd.Timestamp(test_start))
+                       & (calendar <= pd.Timestamp(test_end))]
+
+    rows = []
+    for origin in origins:
+        blocks = []
+        for ticker, frame in histories.items():
+            # Context runs to the origin inclusive and no further: the label at
+            # the origin is the forward return, which is what we are predicting.
+            upto = frame[frame[time_col] <= origin]
+            if len(upto) < runtime.input_size + horizon:
+                continue
+            block = upto.tail(runtime.input_size + horizon)
+            blocks.append(block.rename(columns={id_col: "unique_id",
+                                               time_col: "ds",
+                                               target_col: "y"}))
+        if not blocks:
+            continue
+        history = pd.concat(blocks, ignore_index=True)
+        prediction = nf.predict(df=history)
+        rows.append(_to_grid(prediction, model_name, origin, levels, columns))
+
+    if not rows:
+        return pd.DataFrame(columns=["unique_id", "ds"] + columns)
+    out = pd.concat(rows, ignore_index=True)
+    _assert_origins_match(out, origins, model_name)
+    return out
+
+
+def _to_grid(prediction: pd.DataFrame, model_name: str, origin: pd.Timestamp,
+             levels: list[float], columns: list[str]) -> pd.DataFrame:
+    """Map neuralforecast's wide quantile output onto the frozen column names.
+
+    The output columns are named by the model and the level, and the exact
+    spelling has changed between releases, so they are located by matching the
+    level rather than by assuming a format. A level that cannot be found is an
+    error and not a NaN column: the whole point of the grid gate is that a
+    missing level should never reach the parquet quietly.
+    """
+    frame = prediction.reset_index() if prediction.index.name else prediction.copy()
+    out = pd.DataFrame({"unique_id": frame["unique_id"].to_numpy(),
+                        "ds": origin})
+    for level, column in zip(levels, columns):
+        source = _find_level_column(frame.columns, model_name, level)
+        out[column] = frame[source].to_numpy(dtype=float)
+    return out
+
+
+def _find_level_column(columns, model_name: str, level: float) -> str:
+    """Locate the column carrying one quantile level, by value not by format."""
+    candidates = [c for c in columns if isinstance(c, str) and model_name in c]
+    target = f"{level:g}"
+    exact = [c for c in candidates
+             if c.endswith(f"-ql{target}") or c.endswith(f"-q-{target}")
+             or c.endswith(f"-{target}") or c.endswith(f"-q{target}")]
+    if len(exact) == 1:
+        return exact[0]
+    # Fall back to a numeric scan of whatever trails the model name, so a new
+    # spelling is still found rather than silently producing a NaN column.
+    for column in candidates:
+        tail = column[len(model_name):].lstrip("-_")
+        digits = "".join(ch for ch in tail if ch.isdigit() or ch == ".")
+        try:
+            if digits and abs(float(digits) - level) < 1e-12:
+                return column
+        except ValueError:
+            continue
+        if digits and abs(float(f"0.{digits.replace('.', '')}") - level) < 1e-12:
+            return column
+    raise KeyError(
+        f"{model_name}: no output column for quantile level {level}. "
+        f"Columns present: {sorted(str(c) for c in columns)}. MQLoss emits only "
+        "the levels it was trained on, so a missing level means the loss did "
+        "not receive the frozen grid.")
+
+
+def _assert_origins_match(out: pd.DataFrame, origins, model_name: str) -> None:
+    produced = pd.DatetimeIndex(sorted(pd.unique(out["ds"])))
+    expected = pd.DatetimeIndex(sorted(origins))
+    if not produced.equals(expected):
+        missing = expected.difference(produced)
+        extra = produced.difference(expected)
+        raise AssertionError(
+            f"{model_name}: forecast sessions do not match the test window. "
+            f"{len(missing)} missing, {len(extra)} unexpected. "
+            "A misaligned rolling window would score each forecast against the "
+            "wrong outcome and nothing downstream would notice.")
+
+
+def make_executor(model_name: str):
+    """Bind one model name into the executor signature the runner calls."""
+
+    def executor(panel, train, test_start, test_end, quantiles, **kwargs):
+        return neural_forecast_fold(
+            model_name, panel=panel, train=train, test_start=test_start,
+            test_end=test_end, quantiles=quantiles, **kwargs)
+
+    executor.__name__ = f"{model_name.lower()}_forecast_fold"
+    executor.__doc__ = f"Tier 2 executor for {model_name}; see sp500bench.models.neural."
+    return executor
+
+
+def executors() -> dict:
+    """The seven Tier 2 executors, keyed by roster name."""
+    return {name: make_executor(name) for name in NEURAL_MODELS}

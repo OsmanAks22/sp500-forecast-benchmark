@@ -55,6 +55,9 @@ from sp500bench.evaluation.splits import PurgedWalkForward, assert_no_overlap  #
 from sp500bench.models.baselines import (last_return_forecast_fold,  # noqa: E402
                                          rwd_forecast_fold, warmup_statsforecast,
                                          zero_return_forecast_fold)
+from sp500bench.evaluation.scale import (SigmaOutOfBand,  # noqa: E402
+                                         check_sigma_band)
+from sp500bench.models import neural  # noqa: E402
 from sp500bench.models.statistical import (autoarima_forecast_fold,  # noqa: E402
                                            autoets_forecast_fold)
 from sp500bench.models.volatility_arm import (build_volatility_panel,  # noqa: E402
@@ -93,7 +96,14 @@ EXECUTORS = {
     "HAR-RV": har_forecast_fold,
     "Log-HAR": log_har_forecast_fold,
     "GJR-GARCH": gjr_garch_forecast_fold,
+    # Tier 2 - the supervised deep-learning generation. Seven global models,
+    # one fit per fold across all fifty series. See sp500bench.models.neural
+    # for the Lightning and dataloader constraints, both of which have cost a
+    # Kaggle session.
+    **neural.executors(),
 }
+
+NEURAL_TIER = set(neural.NEURAL_MODELS)
 
 # Libraries that JIT-compile on first use. Warming one up before the clock
 # starts keeps compilation out of fold 0's time; see warmup_statsforecast.
@@ -124,6 +134,23 @@ def parse_args() -> argparse.Namespace:
                         help="wall-clock log (default: results/timings.json)")
     parser.add_argument("--dry-run", action="store_true",
                         help="run the configuration gate, print the roster, and stop")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="redo folds whose forecast file already exists "
+                             "(default: skip them, so a timeout costs the "
+                             "current fold rather than the tier)")
+    parser.add_argument("--device", default="auto",
+                        choices=["auto", "cpu", "cuda", "gpu"],
+                        help="Tier 2 accelerator (default: auto)")
+    parser.add_argument("--num-workers", type=int, default=4,
+                        help="dataloader workers for Tier 2. Goes into "
+                             "dataloader_kwargs, not into the trainer; see "
+                             "sp500bench.models.neural. Lower it if the Kaggle "
+                             "image objects (default: 4)")
+    parser.add_argument("--max-steps", type=int, default=500,
+                        help="training steps per Tier 2 model per fold")
+    parser.add_argument("--input-size", type=int, default=None,
+                        help="Tier 2 lookback; defaults to target.lookback in "
+                             "configs/data.yaml")
     return parser.parse_args()
 
 
@@ -200,6 +227,8 @@ def run_model(
     timings_path: Path,
     warmed: set[str],
     horizon: int = 1,
+    overwrite: bool = False,
+    arm: str = "return",
 ) -> None:
     executor = EXECUTORS[spec.name]
     model_dir = out_root / spec.name
@@ -223,10 +252,21 @@ def run_model(
               "(excluded from fold times)")
 
     fold_times: dict[str, float] = {}
+    skipped_existing: list[int] = []
+    scale_checked = False
     rows_written = 0
     started = time.perf_counter()
 
     for split, train, test in walk_forward.iter_frames(panel, time_col="ds"):
+        path = model_dir / f"fold_{split.fold}.parquet"
+        if path.exists() and not overwrite:
+            # A twelve-hour Kaggle ceiling against seven neural models means a
+            # timeout must cost the current fold, not the tier.
+            print(f"  fold {split.fold}  exists, skipping ({show(path)}) "
+                  "- pass --overwrite to redo")
+            skipped_existing.append(int(split.fold))
+            continue
+
         # iter_frames already runs this before yielding. Repeated here because
         # the guard is the point of the fold structure, and a future refactor
         # that loosens iter_frames should not be able to loosen the runner too.
@@ -242,10 +282,23 @@ def run_model(
             panel=panel, train=train,
             test_start=split.test_start, test_end=split.test_end,
             quantiles=quantiles, target_col="y", horizon=horizon,
+            frozen_grid=quantiles,
         )
         elapsed = time.perf_counter() - t0
 
-        path = model_dir / f"fold_{split.fold}.parquet"
+        # First fold only: is the predictive distribution the right width? Every
+        # silent failure in this project produced plausible numbers, and a model
+        # trained on the wrong grid produces exactly that - present columns,
+        # monotone ordering, finite values, wrong width.
+        if not scale_checked:
+            lower, upper = forecasts.get("q0.1"), forecasts.get("q0.9")
+            if lower is not None and upper is not None:
+                try:
+                    print(f"  scale     {check_sigma_band(lower, upper, arm, spec.name)}")
+                except SigmaOutOfBand as exc:
+                    raise SystemExit(str(exc)) from exc
+            scale_checked = True
+
         forecasts.to_parquet(path, index=False)
         fold_times[str(split.fold)] = round(elapsed, 3)
         rows_written += len(forecasts)
@@ -364,12 +417,32 @@ def main() -> None:
               f"{wf.horizon} + embargo {wf.embargo} = {wf.gap} sessions excised per fold")
 
     out_root, timings_path = Path(args.out), Path(args.timings)
+
+    if any(spec.name in NEURAL_TIER for spec in runnable):
+        runtime = neural.configure(
+            device=args.device,
+            num_workers=args.num_workers,
+            max_steps=args.max_steps,
+            input_size=(args.input_size
+                        or int(data_cfg["target"]["lookback"])),
+            seed=int(cfg.models["training"].get("seed", 20260826)),
+        )
+        # Printed, not assumed. A model trained on a different grid emits only
+        # the levels it was trained on, and the gap surfaces as NaN columns in
+        # evaluate.py long after the GPU hours are spent - so the grid that
+        # actually reaches MQLoss is on the run's face.
+        print(f"\nTier 2 runtime: {runtime.describe()}")
+        print(f"Tier 2 MQLoss grid ({len(cfg.quantiles)} levels): "
+              f"{list(cfg.quantiles)}")
+        neural.assert_training_grid(cfg.quantiles, cfg.quantiles)
+
     warmed: set[str] = set()
     for spec in runnable:
         arm = "volatility" if is_volatility_model(spec) else "return"
         target_panel = volatility_panel if arm == "volatility" else panel
         run_model(spec, target_panel, walk_forwards[arm], cfg.quantiles, out_root,
-                  timings_path, warmed, horizon=cfg.horizon_for(arm))
+                  timings_path, warmed, horizon=cfg.horizon_for(arm),
+                  overwrite=args.overwrite, arm=arm)
 
     print("\nDone.")
 

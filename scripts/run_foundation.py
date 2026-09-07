@@ -172,6 +172,9 @@ from sp500bench.config import (load_configs, load_data_config,  # noqa: E402
                                quantile_column, quantile_columns)
 from sp500bench.evaluation.splits import (PurgedWalkForward,  # noqa: E402
                                           assert_no_overlap)
+from sp500bench.evaluation.scale import (Q90_Q10_TO_SIGMA,  # noqa: E402,F401
+                                         SIGMA_BANDS, SigmaOutOfBand,
+                                         check_sigma_band, implied_daily_sigma)
 from sp500bench.models.registry import BY_NAME  # noqa: E402
 
 FOUNDATION_MODELS = ["Chronos-2", "TimesFM-2.5", "TTM", "Kronos-small"]
@@ -252,40 +255,6 @@ def show(path: Path) -> str:
 # --------------------------------------------------------------------------
 # timings
 # --------------------------------------------------------------------------
-
-# q0.9 - q0.1 spans 2 * Phi^-1(0.9) standard deviations of a normal.
-Q90_Q10_TO_SIGMA = 2.0 * 1.2815515655446004          # 2.5631
-
-# Sanity bands on the implied daily sigma of a predictive distribution.
-#
-# NOT PRINCIPLED. These are empirical guardrails calibrated to this panel -
-# fifty large-cap US equities, 2005-2026 - and they would be wrong for another
-# asset class, another universe, or another horizon. They exist to catch a
-# model that is off by a factor, not to judge one that is off by a few percent.
-#
-# Return arm: the realised 1-day log return has sd 0.0183 on this panel, 0.0109
-# to 0.0305 per ticker. The band spans roughly a ninth of that to four and a
-# half times it, so a fold as violent as 2020 stays comfortably inside while a
-# fivefold error does not.
-#
-# Volatility arm: a different quantity on a different scale - the 21-session
-# forward Yang-Zhang estimate, whose values run 0.0065 to 0.0572 between the
-# 1st and 99th percentiles with sd 0.0096. A single global band would pass
-# anything the return arm allows and so would never fire here.
-SIGMA_BANDS = {
-    "return": (0.002, 0.08),
-    "volatility": (0.0002, 0.03),
-}
-
-
-def implied_daily_sigma(q10: np.ndarray, q90: np.ndarray) -> float:
-    """Predictive sigma implied by the 80% interval, ignoring non-finite rows."""
-    width = np.asarray(q90, dtype=float) - np.asarray(q10, dtype=float)
-    width = width[np.isfinite(width)]
-    if not width.size:
-        return float("nan")
-    return float(np.mean(width) / Q90_Q10_TO_SIGMA)
-
 
 def _checkpoint_config(repo_id: str | None) -> dict | None:
     """The checkpoint's own config.json, from the local cache.
@@ -884,34 +853,21 @@ class Adapter:
               "declares")
 
     def assert_sigma_in_band(self, levels: np.ndarray) -> None:
-        """First-batch scale check. See SIGMA_BANDS - empirical, not principled."""
+        """First-batch scale check, shared with the neural tier.
+
+        One definition of the bands, in sp500bench.evaluation.scale, so the two
+        runners cannot drift apart on what counts as a plausible width.
+        """
         grid = list(self.our_grid)
         if 0.1 not in grid or 0.9 not in grid:
             return
-        sigma = implied_daily_sigma(levels[:, grid.index(0.1)],
-                                    levels[:, grid.index(0.9)])
-        if not np.isfinite(sigma):
-            print("    scale         no finite 80% interval on the first batch; "
-                  "band check skipped")
-            return
-        low, high = SIGMA_BANDS[self.arm]
-        annualised = sigma * np.sqrt(252) * 100
-        if not (low <= sigma <= high):
-            raise SystemExit(
-                f"{self.name}: implied daily sigma {sigma:.5f} "
-                f"({annualised:.1f}% annualised) is outside the {self.arm}-arm "
-                f"band [{low}, {high}] on the first batch.\n"
-                "  This is a scale guardrail calibrated to this panel, not a "
-                "principled bound;\n"
-                "  it fires on errors of a factor, not of a few percent. A "
-                "model this far from\n"
-                "  the realised scale is almost always a loading or "
-                "normalisation fault, not a\n"
-                "  forecast. Check the checkpoint and the input series before "
-                "spending a run.")
-        print(f"    scale         implied daily sigma {sigma:.5f} "
-              f"({annualised:.1f}% ann), inside the {self.arm} band "
-              f"[{low}, {high}]")
+        try:
+            report = check_sigma_band(levels[:, grid.index(0.1)],
+                                      levels[:, grid.index(0.9)],
+                                      arm=self.arm, label=self.name)
+        except SigmaOutOfBand as exc:
+            raise SystemExit(str(exc)) from exc
+        print(f"    scale         {report}")
 
     def provenance(self) -> dict:
         """Exactly which weights and which code produced this run."""
