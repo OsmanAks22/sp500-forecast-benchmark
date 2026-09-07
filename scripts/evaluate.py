@@ -80,7 +80,7 @@ from sp500bench.evaluation.metrics import (crps_from_quantiles,  # noqa: E402
                                            directional_accuracy_with_ci, mae,
                                            mean_interval_score, picp, rmse)
 from sp500bench.evaluation.splits import PurgedWalkForward  # noqa: E402
-from sp500bench.models.registry import BY_NAME, REGISTRY  # noqa: E402
+from sp500bench.models.registry import BY_NAME, REGISTRY, runnable  # noqa: E402
 from sp500bench.models.volatility_arm import build_volatility_panel  # noqa: E402
 
 # Below this many distinct sessions the block bootstrap is resampling too few
@@ -503,6 +503,52 @@ def _show(path: Path) -> str:
         return str(path)
 
 
+PENDING = "[PENDING]"
+
+
+def roster_status(root: Path, folds: list[int]) -> tuple[list[str], list[str]]:
+    """Which runnable specs have forecasts on disk, and which do not."""
+    expected = [spec.name for spec in runnable()]
+    present, pending = [], []
+    for name in expected:
+        (present if not load_forecasts(root, name, folds).empty
+         else pending).append(name)
+    return present, pending
+
+
+def print_roster_caption(present: list[str], pending: list[str]) -> None:
+    """The roster every table above was computed on.
+
+    A table is only meaningful beside the set of models it ranks, and a table
+    copied into a chapter loses that context unless it travels with it. Missing
+    models are named rather than omitted, because a reader cannot tell an absent
+    model from one that was never in the study.
+    """
+    total = len(present) + len(pending)
+    print(f"\nROSTER: computed on {len(present)} of {total} runnable models.")
+    print(f"  present ({len(present)}): {', '.join(present)}")
+    if not pending:
+        print("  no models pending - this is the complete runnable roster.")
+        return
+    print(f"  {PENDING} ({len(pending)}): {', '.join(pending)}")
+    print("  These have no forecasts on disk, so no cell was computed for them.")
+    print(f"  Their rows read {PENDING} and never a number. Rankings, set")
+    print("  membership and any 'best model' claim are provisional until they land.")
+
+
+def print_pending_rows(pending: list[str], arm_of_model, arm: str,
+                       label_width: int, name_width: int,
+                       n_metrics: int, metric_width: int = 9) -> None:
+    """One row per absent model, carrying a token that cannot be read as data."""
+    rows = [m for m in pending if arm_of_model(m) == arm]
+    if not rows:
+        return
+    print()
+    for model in sorted(rows):
+        cells = "".join(f"{PENDING:>{metric_width}}" for _ in range(n_metrics))
+        print(f"{'':<{label_width}}{model:<{name_width}}{cells}")
+
+
 def _display_name(model: str, grids: dict[str, CrpsGrid]) -> str:
     """A model scored on a partial grid carries a mark everywhere it is printed.
 
@@ -558,7 +604,8 @@ def _wrap(text: str, width: int) -> list[str]:
 
 
 def print_volatility_arm(table: pd.DataFrame, grids: dict[str, CrpsGrid],
-                         reference: str = "Log-HAR") -> None:
+                         reference: str = "Log-HAR",
+                         pending: list[str] | None = None) -> None:
     """The volatility arm, read against Log-HAR.
 
     Log-HAR is the reference because it is the benchmark the literature says
@@ -596,6 +643,7 @@ def print_volatility_arm(table: pd.DataFrame, grids: dict[str, CrpsGrid],
                   f"{r['picp_80'] * 100:>8.1f}%{marker}")
             label = ""
 
+    print_pending_rows(pending or [], arm_of, "volatility", 26, 12, 7, 9)
     print("\nRatios are model / reference; below 1.00 beats the reference.")
     print("Directional accuracy is omitted: realised volatility is positive, so the")
     print("sign always matches and the statistic is identically 1.")
@@ -605,7 +653,8 @@ def print_volatility_arm(table: pd.DataFrame, grids: dict[str, CrpsGrid],
     print("each test window rather than 6.")
 
 
-def print_comparison(table: pd.DataFrame, grids: dict[str, CrpsGrid]) -> None:
+def print_comparison(table: pd.DataFrame, grids: dict[str, CrpsGrid],
+                     pending: list[str] | None = None) -> None:
     table = table[table.arm == "return"]
     if table.empty:
         return
@@ -628,6 +677,7 @@ def print_comparison(table: pd.DataFrame, grids: dict[str, CrpsGrid]) -> None:
               f"{r['n_obs']:>8,}{r['mase']:>8.3f}{r['directional_accuracy'] * 100:>7.2f}%"
               f"{r['rmse']:>9.5f}{r['crps']:>10.5f}{r['picp_80'] * 100:>7.1f}%")
         previous = label
+    print_pending_rows(pending or [], arm_of, "return", 26, 22, 6, 9)
     print("\nPICP80 is the share of outcomes inside the q0.1-q0.9 band; 80% is nominal.")
     print("* marks a model not scored on the frozen grid; its CRPS is not directly")
     print("  comparable to the unmarked rows. See the footnote below. nan means the")
@@ -762,9 +812,11 @@ def main() -> None:
     losses_out = Path(args.losses_out)
     losses.to_parquet(losses_out, index=False)
 
-    print_comparison(table, grids)
-    print_volatility_arm(table, grids)
+    present, pending = roster_status(forecast_root, folds)
+    print_comparison(table, grids, pending)
+    print_volatility_arm(table, grids, pending=pending)
     print_grid_notes(grids, cfg)
+    print_roster_caption(present, pending)
     print(f"\n{len(table)} cells -> {_show(out)}")
     print(f"{len(losses):,} per-observation losses "
           f"({losses['loss_type'].nunique()} types x {losses['model'].nunique()} models) "
