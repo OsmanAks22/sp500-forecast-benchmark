@@ -481,14 +481,46 @@ def test_a_timing_record_carries_the_machine_that_produced_it(tmp_path):
 
 
 def test_records_from_different_machines_are_not_comparable():
+    """Comparability is a property of the environment, not of the process.
+
+    This assertion previously required a matching ``session_id`` and that was
+    the wrong granularity. A hosted notebook runs each model as a separate
+    `!python scripts/...` invocation, so eleven models on one A100 in one
+    container carry eleven different per-process ids; gating on that made the
+    whole within-generation comparison unquotable for no methodological gain,
+    because a wall-clock ratio does not depend on which process measured it.
+
+    The requirement is now platform, accelerator and numeric stack. Session id
+    is still recorded on every row and printed beside the figures - it is
+    evidence about provenance - but it no longer decides whether a ratio is a
+    measurement.
+    """
     from sp500bench.evaluation.timings import comparable, hardware_fingerprint
     here = hardware_fingerprint()
     assert comparable(here, dict(here)) is True
+
+    # Same machine and stack, different process: comparable. This is the case
+    # the old assertion refused and the reason it was changed.
+    assert comparable(here, {**here, "session_id": "other"}) is True
+
+    # Different machine, or different stack: not comparable.
     assert comparable(here, {**here, "accelerator": "Tesla T4"}) is False
-    assert comparable(here, {**here, "session_id": "other"}) is False
     assert comparable(here, {**here, "platform": "Linux-6.1"}) is False
-    # A record with no fingerprint at all cannot be compared to anything.
+    assert comparable(here, {**here, "pandas_version": "3.0.5"}) is False
+    assert comparable(here, {**here, "torch_version": "9.9.9"}) is False
+    # torch is optional because the statistical tier does not use it: two rows
+    # that both lack it are still comparable, one that has it against one that
+    # does not is not.
+    without = {k: v for k, v in here.items() if k != "torch_version"}
+    assert comparable(without, dict(without)) is True
+    assert comparable(without, {**without, "torch_version": "2.11.0"}) is False
+
+    # A record with no fingerprint at all cannot be compared to anything - and
+    # two such records are not comparable with each other either. Absence is not
+    # agreement: two unstamped rows are not known to share a machine, they are
+    # known to say nothing about it.
     assert comparable(here, {}) is False
+    assert comparable({}, {}) is False
 
 
 def test_hardware_is_part_of_run_identity_so_folds_do_not_merge_across_machines():

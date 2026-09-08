@@ -42,10 +42,12 @@ RUN_IDENTITY_FIELDS = ("context", "device", "sample_count", "precision",
                        # or on a different lookback is not the same measurement
                        # either. `device` is already in the list above.
                        "max_steps", "input_size", "num_workers",
-                       # A fold re-timed on another machine is not the same
-                       # measurement, and merging the two would produce a
-                       # per-fold average across two pieces of hardware.
-                       "platform", "accelerator")
+                       # A fold re-timed on another machine, or under a
+                       # different numeric stack, is not the same measurement;
+                       # merging the two would produce a per-fold average across
+                       # two environments.
+                       "platform", "accelerator", "torch_version",
+                       "pandas_version")
 
 
 def merge_timing(prior: dict | None, payload: dict) -> dict:
@@ -171,20 +173,73 @@ def hardware_fingerprint() -> dict:
         "python": platform.python_version(),
         "accelerator": "cpu",
     }
-    try:                                               # pragma: no cover - no GPU locally
+    try:
+        import pandas
+        info["pandas_version"] = str(pandas.__version__)
+    except Exception:
+        pass
+    try:
         import torch
-        if torch.cuda.is_available():
+        # Recorded whenever torch is importable, not only under CUDA: the
+        # numeric stack is part of what a wall-clock ratio depends on, and the
+        # foundation runner's records name this field, so a CPU row that omits
+        # it is not comparable with anything and silently drops out.
+        info["torch_version"] = str(torch.__version__)
+        if torch.cuda.is_available():                  # pragma: no cover - no GPU locally
             info["accelerator"] = torch.cuda.get_device_name(0)
-            info["torch"] = str(torch.__version__)
     except Exception:
         pass
     return info
 
 
+# What must match for a ratio between two timings to be a measurement of the
+# models rather than of two computers.
+#
+# Session id is deliberately NOT in this list, and was at first. A hosted
+# notebook runs each model as a separate `!python scripts/...` invocation, so a
+# per-process id differs between every row even when eleven models ran on the
+# same accelerator, in the same container, minutes apart. Gating on it made the
+# entire within-generation comparison unquotable, which is a stricter answer
+# than the question deserves: process identity is not what a wall-clock ratio
+# depends on.
+#
+# What it does depend on is the machine and the software stack. `pandas_version`
+# is here because it has already mattered - three foundation models ran after a
+# pip install pulled pandas to 3.0.5 while the rest of that session ran on 2.x,
+# and a session id alone would have implied a shared environment they did not
+# have.
+# Always recordable, so absence means the row was written before stamping and
+# nothing can be said about it. Must be present on both sides and equal.
+REQUIRED_COMPARABLE = ("platform", "accelerator", "pandas_version")
+
+# Recordable only where the library is installed. The CPU tier has no torch, so
+# demanding it would make every statistical model non-comparable with every
+# other one - including with itself. Compared when both sides have it, ignored
+# when neither does, and treated as a mismatch when only one does, because a row
+# that ran under torch and a row that did not are not the same environment.
+OPTIONAL_COMPARABLE = ("torch_version",)
+
+COMPARABLE_FIELDS = REQUIRED_COMPARABLE + OPTIONAL_COMPARABLE
+
+
 def comparable(a: dict, b: dict) -> bool:
-    """Whether a ratio between two timing records is a measurement at all."""
-    keys = ("session_id", "platform", "accelerator")
-    return all(a.get(k) is not None and a.get(k) == b.get(k) for k in keys)
+    """Whether a ratio between two timing records is a measurement at all.
+
+    Session id is recorded on every row and reported beside the figures, but it
+    is not a gate. Two rows from different processes on the same machine and the
+    same stack are comparable; two rows from one process on different stacks are
+    not.
+
+    A record missing any of these fields is not comparable with anything,
+    including another record missing the same fields. Absence is not a match:
+    two unstamped rows are not known to share a machine, they are known to say
+    nothing about it, and treating None == None as agreement would manufacture
+    exactly the false comparison this function exists to refuse.
+    """
+    if not all(a.get(k) is not None and a.get(k) == b.get(k)
+               for k in REQUIRED_COMPARABLE):
+        return False
+    return all(a.get(k) == b.get(k) for k in OPTIONAL_COMPARABLE)
 
 
 def _roster_block(models: list[str]) -> dict:
