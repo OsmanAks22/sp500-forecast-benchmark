@@ -236,6 +236,10 @@ def assert_grid_matches_data(model: str, scored: pd.DataFrame, grid: CrpsGrid,
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Score forecasts into results/metrics.parquet.")
     p.add_argument("--forecasts", default=str(ROOT / "forecasts"))
+    p.add_argument("--score-broken", action="store_true",
+                   help="score the models in BROKEN_MODELS as well, so their "
+                        "cells can be inspected. They are excluded by default "
+                        "because their written output is not the model's.")
     p.add_argument("--features", default=str(ROOT / "data" / "features.parquet"))
     p.add_argument("--regimes", default=str(ROOT / "data" / "regimes.parquet"))
     p.add_argument("--bars", default=str(ROOT / "data" / "processed" / "panel.parquet"),
@@ -410,7 +414,8 @@ def cell_metrics(cell: pd.DataFrame, cfg, denominators, n_boot: int,
     }
 
 
-def build_losses(model: str, scored: pd.DataFrame, cfg) -> pd.DataFrame:
+def build_losses(model: str, scored: pd.DataFrame, cfg,
+                 grid: CrpsGrid | None = None) -> pd.DataFrame:
     """Per-observation losses in long form, for the DM tests and the MCS.
 
     One row per model x ticker x session x loss type. ``squared_error`` and
@@ -430,7 +435,15 @@ def build_losses(model: str, scored: pd.DataFrame, cfg) -> pd.DataFrame:
         "squared_error": (y - point) ** 2,
         "absolute_error": np.abs(y - point),
     }
-    for q, column in zip(cfg.quantiles, cfg.quantile_columns):
+    # Only levels this model's CRPS is built from. A model whose quantile
+    # columns are not ordered has a pinball loss at every level and a
+    # predictive distribution at none, and writing those rows would let a
+    # CRPS-based DM test or MCS pick them up downstream - where nothing knows
+    # the ordering was wrong. The point-forecast rows above are unaffected:
+    # they read the median, which is correctly mapped.
+    scored_levels = (list(zip(cfg.quantiles, cfg.quantile_columns))
+                     if grid is None else list(zip(grid.levels, grid.columns)))
+    for q, column in scored_levels:
         delta = y - scored[column].to_numpy(dtype=float)
         losses[f"pinball_{column}"] = np.maximum(q * delta, (q - 1.0) * delta)
 
@@ -504,19 +517,138 @@ def _show(path: Path) -> str:
 
 
 PENDING = "[PENDING]"
+BROKEN = "[BROKEN]"
+
+# Models whose written output is not the model's, so no cell of theirs is a
+# measurement. Excluded from scoring entirely rather than scored and starred:
+# a starred row still invites a reader to compare it, and there is nothing here
+# to compare.
+#
+# This is not a performance judgement and the distinction matters for the
+# pre-registration. Dropping a model after seeing it score badly is a post-hoc
+# roster decision; dropping one after establishing that its output is not what
+# the model produced is the same call already made for a foundation checkpoint
+# loaded through the wrong class.
+BROKEN_MODELS = {
+    "NLinear": (
+        "median carries a constant shift of about -6.2% per day, invariant "
+        "across all four folds (-0.06231, -0.06173, -0.06292, -0.06211) and "
+        "across all fifty tickers (-0.06310 to -0.06045). A model responding to "
+        "data does not hold a location constant while the regime changes, so "
+        "the point axes measure the shift rather than the model. Its quantile "
+        "columns are additionally non-monotone on every row."),
+}
+
+# Above what share of non-monotone rows a model's distributional cells stop
+# being measurements.
+#
+# The threshold separates two things that both show up as a crossing and are not
+# the same fault. A **mapping** fault - columns written in the wrong order -
+# inverts pairs on essentially every row: DLinear's scrambled grid is
+# non-monotone on 100.0% of rows, with 51.6% of all adjacent pairs inverted,
+# which is what shuffling nine columns looks like. A **model** pathology - a
+# quantile head trained without a monotonicity constraint - crosses rarely:
+# TimesNet crosses on 0.1% of rows (87 of 83,450). The first makes the CRPS a
+# score of the wrong quantity; the second is a known and reportable property of
+# independently-parameterised quantile regression, and its pinball average is
+# still over correctly-mapped levels.
+#
+# 5% is chosen to sit in the empty region between the two measured populations
+# rather than near either. It is not a principled constant and a model landing
+# between 5% and 50% would need looking at rather than classifying - the
+# measured share is printed for every model so that case is visible instead of
+# being decided silently by this number.
+NON_MONOTONE_TOLERANCE = 0.05           # share of rows; above this, suppress
 
 
-def roster_status(root: Path, folds: list[int]) -> tuple[list[str], list[str]]:
-    """Which runnable specs have forecasts on disk, and which do not."""
+def monotone_share(scored: pd.DataFrame, cfg) -> float:
+    columns = [c for c in cfg.quantile_columns if c in scored.columns]
+    values = scored[columns].to_numpy(dtype=float)
+    finite = np.isfinite(values).all(axis=1)
+    if not finite.any():
+        return 1.0
+    ordered = (np.diff(values[finite], axis=1) >= -1e-12).all(axis=1)
+    return float(ordered.mean())
+
+
+def downgrade_unordered(model: str, scored: pd.DataFrame, grid: CrpsGrid,
+                        cfg) -> tuple[CrpsGrid, float]:
+    """Suppress the distributional cells of a model whose levels are not ordered.
+
+    A quantile grid must be non-decreasing across levels. Where it is not, the
+    columns are not the model's predictive distribution and the CRPS, PICP and
+    interval score computed from them are not measurements of anything - the
+    number still forms, which is the whole problem.
+
+    The point axes are untouched. RMSE, MAE, MASE and directional accuracy read
+    ``cfg.median_column`` alone, which is correctly mapped whatever order its
+    neighbours arrived in, so suppressing them would discard four real
+    measurements to punish a fault in three others.
+
+    The suppressed model is left in the tables carrying the same ``*`` that a
+    model without a quantile head carries, and the reason is printed with the
+    other grid notes. Marked rather than deleted: a reader can see that the
+    model ran, what it scores on the axes that survive, and why the rest are
+    absent."""
+    share = monotone_share(scored, cfg)
+    if not grid.levels or share >= 1.0 - NON_MONOTONE_TOLERANCE:
+        return grid, share
+    return CrpsGrid(
+        label="unordered",
+        levels=(),
+        comparable=False,
+        note=(f"{100 * (1 - share):.1f}% of rows have a non-monotone quantile "
+              "grid, so the columns are not a predictive distribution and CRPS, "
+              "PICP and the interval score are suppressed. The point metrics "
+              "read the median only and stand."),
+        unavailable=()), share
+
+
+def roster_status(root: Path, folds: list[int],
+                  score_broken: bool = False) -> tuple[list[str], list[str], list[str]]:
+    """Which runnable specs have forecasts on disk, which do not, which are void.
+
+    Three states, not two. A model with no forecasts is *pending* - it may yet
+    produce a number. A model in ``BROKEN_MODELS`` has forecasts and they are
+    not the model's, so no number it could produce would be a measurement; it is
+    excluded from scoring and reported separately, because collapsing it into
+    "pending" would suggest it is waiting on a run.
+    """
     expected = [spec.name for spec in runnable()]
-    present, pending = [], []
+    present, pending, broken = [], [], []
     for name in expected:
-        (present if not load_forecasts(root, name, folds).empty
-         else pending).append(name)
-    return present, pending
+        if name in BROKEN_MODELS and not score_broken:
+            broken.append(name)
+        elif not load_forecasts(root, name, folds).empty:
+            present.append(name)
+        else:
+            pending.append(name)
+    return present, pending, broken
 
 
-def print_roster_caption(present: list[str], pending: list[str]) -> None:
+def print_broken_caption(broken: list[str]) -> None:
+    """Named, with the evidence, rather than quietly absent.
+
+    A model dropped without a stated reason is indistinguishable from a model
+    dropped because it scored badly, and this study's protocol was fixed before
+    the results were known. So the reason is printed with the tables it is
+    absent from, and it is a statement about the output rather than about the
+    performance.
+    """
+    if not broken:
+        return
+    print(f"\n{BROKEN} ({len(broken)}): {', '.join(sorted(broken))}")
+    for model in sorted(broken):
+        print(f"  {model}: {BROKEN_MODELS[model]}")
+    print("  Excluded from every table above, from the DM tests and from the")
+    print("  Model Confidence Set. This is a statement about the written output,")
+    print("  not about the model's accuracy: its cells were not scored, so no")
+    print("  comparison was made and none was rejected. Pass --score-broken to")
+    print("  score them anyway and inspect the cells.")
+
+
+def print_roster_caption(present: list[str], pending: list[str],
+                        broken: list[str] = ()) -> None:
     """The roster every table above was computed on.
 
     A table is only meaningful beside the set of models it ranks, and a table
@@ -524,9 +656,11 @@ def print_roster_caption(present: list[str], pending: list[str]) -> None:
     models are named rather than omitted, because a reader cannot tell an absent
     model from one that was never in the study.
     """
-    total = len(present) + len(pending)
+    total = len(present) + len(pending) + len(broken)
     print(f"\nROSTER: computed on {len(present)} of {total} runnable models.")
     print(f"  present ({len(present)}): {', '.join(present)}")
+    if broken:
+        print(f"  {BROKEN} ({len(broken)}): {', '.join(sorted(broken))} - see below.")
     if not pending:
         print("  no models pending - this is the complete runnable roster.")
         return
@@ -577,7 +711,12 @@ def print_grid_notes(grids: dict[str, CrpsGrid], cfg) -> None:
           f"between models scored\non the same levels. Unmarked models use the "
           f"frozen grid: {list(cfg.quantiles)}.\n")
     for model, grid in sorted(marked.items()):
-        levels = list(grid.levels) if grid.levels else "none - no quantile head"
+        if grid.levels:
+            levels = list(grid.levels)
+        elif grid.label == "unordered":
+            levels = "suppressed - the head emits levels but not in order"
+        else:
+            levels = "none - no quantile head"
         print(f"  {model}")
         print(f"    grid   {grid.label}: {levels}")
         if not grid.levels:
@@ -756,6 +895,8 @@ def main() -> None:
 
     forecast_root = Path(args.forecasts)
     wanted = args.models or [m.name for m in REGISTRY]
+    if not args.score_broken:
+        wanted = [m for m in wanted if m not in BROKEN_MODELS]
     present = [m for m in wanted if not load_forecasts(forecast_root, m, folds).empty]
 
     # Two arms, two targets, two panels. Built only if that arm has forecasts.
@@ -787,14 +928,23 @@ def main() -> None:
 
         grid = load_crps_grid(forecast_root, model, cfg)
         assert_grid_matches_data(model, scored, grid, cfg)
+        # Ordering is checked after the declared grid, not instead of it: a
+        # model can satisfy every declaration in its grid.json and still have
+        # written its levels in the wrong order.
+        grid, share = downgrade_unordered(model, scored, grid, cfg)
         grids[model] = grid
 
         suffix = "" if grid.comparable else f"  [CRPS grid '{grid.label}', marked *]"
+        if share < 1.0:
+            suffix += f"  {100 * (1 - share):.2f}% of rows non-monotone"
+            suffix += (" - CRPS/PICP suppressed" if grid.label == "unordered"
+                       else f" (under the {100 * NON_MONOTONE_TOLERANCE:.0f}% "
+                            "threshold; scored, and reported)")
         print(f"  {model:<22} {arm:<11} {len(scored):>7,} forecasts over "
               f"{len(folds)} folds{suffix}")
         rows.extend(build_rows(model, scored, cfg, denominators[arm], folds,
                                args.n_boot, grid))
-        loss_frames.append(build_losses(model, scored, cfg))
+        loss_frames.append(build_losses(model, scored, cfg, grid))
 
     if not rows:
         raise SystemExit(
@@ -812,11 +962,13 @@ def main() -> None:
     losses_out = Path(args.losses_out)
     losses.to_parquet(losses_out, index=False)
 
-    present, pending = roster_status(forecast_root, folds)
+    present, pending, broken = roster_status(forecast_root, folds,
+                                             args.score_broken)
     print_comparison(table, grids, pending)
     print_volatility_arm(table, grids, pending=pending)
     print_grid_notes(grids, cfg)
-    print_roster_caption(present, pending)
+    print_roster_caption(present, pending, broken)
+    print_broken_caption(broken)
     print(f"\n{len(table)} cells -> {_show(out)}")
     print(f"{len(losses):,} per-observation losses "
           f"({losses['loss_type'].nunique()} types x {losses['model'].nunique()} models) "
