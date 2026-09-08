@@ -33,6 +33,7 @@ import pandas as pd
 import pytest
 
 from sp500bench.config import load_configs, quantile_column
+from sp500bench.models.broken import BROKEN_MODELS
 from sp500bench.models.registry import runnable
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -197,6 +198,25 @@ def test_the_broken_flag_puts_it_back(tmp_path):
     _, pending, broken = evaluate.roster_status(tmp_path, [0], score_broken=True)
     assert broken == []
     assert "NLinear" in pending          # no forecasts under tmp_path
+
+
+def test_the_broken_registry_has_one_home(tmp_path):
+    """evaluate.py and backtest.py must not be able to disagree.
+
+    backtest.py excluding a different set from evaluate.py would not produce a
+    wrong table so much as an incoherent one - and the deflated Sharpe hurdle is
+    parameterised by the number of strategies tried, so a broken model left in
+    backtest's count silently raises the bar for every other model.
+    """
+    import importlib.util as u
+    spec = u.spec_from_file_location("backtest_under_test",
+                                     ROOT / "scripts" / "backtest.py")
+    module = u.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    assert module.BROKEN_MODELS is BROKEN_MODELS
+    assert evaluate.BROKEN_MODELS is BROKEN_MODELS
 
 
 def test_every_broken_model_states_its_evidence():

@@ -80,6 +80,7 @@ from sp500bench.evaluation.metrics import (crps_from_quantiles,  # noqa: E402
                                            directional_accuracy_with_ci, mae,
                                            mean_interval_score, picp, rmse)
 from sp500bench.evaluation.splits import PurgedWalkForward  # noqa: E402
+from sp500bench.models.broken import BROKEN_MODELS  # noqa: E402
 from sp500bench.models.registry import BY_NAME, REGISTRY, runnable  # noqa: E402
 from sp500bench.models.volatility_arm import build_volatility_panel  # noqa: E402
 
@@ -362,6 +363,19 @@ def cell_metrics(cell: pd.DataFrame, cfg, denominators, n_boot: int,
         # accuracy is identically 1. Left null rather than written as a perfect
         # score that means nothing.
         da = {}
+    elif not np.any(np.sign(point[np.isfinite(point)])):
+        # A forecast that is identically zero makes no directional call at all,
+        # so the statistic is undefined rather than zero. ``sign(0)`` matches
+        # nothing, and the convention that drops flat *outcomes* does not drop
+        # flat *forecasts* - so the mechanical 0% is an artefact of the
+        # statistic and not a directional failure.
+        #
+        # This is the reference model for H1, so the cell is the one most likely
+        # to be read as a result: 0.00% with a [0.00%, 0.00%] interval says the
+        # random walk is directionally catastrophic, which is the opposite of
+        # what it says. The README fixed this convention when ZeroReturn was
+        # identified as the benchmark; this is where it is implemented.
+        da = {}
     elif n_days >= MIN_DAYS_FOR_CI:
         da = directional_accuracy_with_ci(y, point, cell["ds"], n_boot=n_boot)
     else:
@@ -518,26 +532,6 @@ def _show(path: Path) -> str:
 
 PENDING = "[PENDING]"
 BROKEN = "[BROKEN]"
-
-# Models whose written output is not the model's, so no cell of theirs is a
-# measurement. Excluded from scoring entirely rather than scored and starred:
-# a starred row still invites a reader to compare it, and there is nothing here
-# to compare.
-#
-# This is not a performance judgement and the distinction matters for the
-# pre-registration. Dropping a model after seeing it score badly is a post-hoc
-# roster decision; dropping one after establishing that its output is not what
-# the model produced is the same call already made for a foundation checkpoint
-# loaded through the wrong class.
-BROKEN_MODELS = {
-    "NLinear": (
-        "median carries a constant shift of about -6.2% per day, invariant "
-        "across all four folds (-0.06231, -0.06173, -0.06292, -0.06211) and "
-        "across all fifty tickers (-0.06310 to -0.06045). A model responding to "
-        "data does not hold a location constant while the regime changes, so "
-        "the point axes measure the shift rather than the model. Its quantile "
-        "columns are additionally non-monotone on every row."),
-}
 
 # Above what share of non-monotone rows a model's distributional cells stop
 # being measurements.

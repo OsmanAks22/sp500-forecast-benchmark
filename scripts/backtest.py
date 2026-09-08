@@ -59,9 +59,11 @@ if str(ROOT / "src") not in sys.path:
 from sp500bench.backtest.strategy import (positions_from_forecast,  # noqa: E402
                                           run_backtest)
 from sp500bench.config import ConfigError, load_configs  # noqa: E402
+from sp500bench.models.broken import BROKEN_MODELS  # noqa: E402
 from sp500bench.models.registry import BY_NAME, runnable  # noqa: E402
 
 PENDING = "[PENDING]"
+BROKEN = "[BROKEN]"
 
 # Fields eval.yaml asks the backtest to report, in the order the tables use.
 REPORTED = ["turnover_ann", "break_even_round_trip_bps", "sharpe_net",
@@ -223,8 +225,16 @@ def main() -> None:
              .rename(columns={"target": "y"}))
     root = Path(args.forecasts)
 
-    expected = [s.name for s in runnable() if arm_of(s.name) == "return"]
-    wanted = args.models or expected
+    # A broken model is excluded before the roster is split, not filtered out of
+    # the table afterwards. n_trials below is the number of strategies actually
+    # tried, and it sets the deflated Sharpe hurdle every other model must
+    # clear - so leaving a model whose output is not a forecast in the count
+    # would penalise all of them for a strategy that was never tested.
+    expected = [s.name for s in runnable()
+                if arm_of(s.name) == "return" and s.name not in BROKEN_MODELS]
+    broken = [s.name for s in runnable()
+              if arm_of(s.name) == "return" and s.name in BROKEN_MODELS]
+    wanted = [m for m in (args.models or expected) if m not in BROKEN_MODELS]
     present, pending = [], []
     for name in expected:
         (present if not load_forecasts(root, name).empty else pending).append(name)
@@ -260,6 +270,13 @@ def main() -> None:
     table.to_parquet(out, index=False)
 
     print_table(table, cost_levels, present, pending)
+    if broken:
+        print(f"\n{BROKEN} ({len(broken)}): {', '.join(sorted(broken))}")
+        for model in sorted(broken):
+            print(f"  {model}: {BROKEN_MODELS[model]}")
+        print("  No simulation was run. Excluded from the roster above and from")
+        print(f"  n_trials, so the deflated Sharpe hurdle is set by the "
+              f"{len(present)} strategies actually tried.")
     print(f"\n{len(table):,} rows -> {out.relative_to(ROOT)}")
 
 
