@@ -439,3 +439,66 @@ def test_a_training_frame_reaching_the_test_window_is_refused():
             "DLinear", panel=train, train=train,
             test_start=dates[-1], test_end=dates[-1],
             quantiles=FROZEN, frozen_grid=FROZEN)
+
+
+def test_the_timing_file_records_the_roster_it_describes(tmp_path):
+    """A partial file replacing a complete one must be detectable.
+
+    The merge guard protects the record inside a session. It cannot protect
+    against the file being replaced from outside one - a copy back from a hosted
+    notebook overwrote fifteen models' timings with two, and nothing in the file
+    said it had ever held more. A check that cannot fire would be worthless, so
+    the artefact describes itself instead: a reader comparing this list against
+    the directories under forecasts/ sees the gap immediately.
+    """
+    from sp500bench.evaluation.timings import ROSTER_KEY, record_timing
+    path = tmp_path / "timings.json"
+    record_timing(path, "ZeroReturn", {"n_folds": 4, "seconds_per_fold": {"0": 1.0},
+                                       "forecasts_per_fold": {"0": 12650}})
+    record_timing(path, "AutoETS", {"n_folds": 4, "seconds_per_fold": {"0": 2.0},
+                                    "forecasts_per_fold": {"0": 12650}})
+    written = json.loads(path.read_text())
+    roster = written[ROSTER_KEY]
+    assert roster["models"] == ["AutoETS", "ZeroReturn"]
+    assert roster["n_models"] == 2
+    assert "updated_at" in roster
+    assert "replaced rather than merged" in roster["note"]
+    # The block must not be mistaken for a model.
+    assert ROSTER_KEY.startswith("_")
+    assert set(written) - {ROSTER_KEY} == {"ZeroReturn", "AutoETS"}
+
+
+def test_a_timing_record_carries_the_machine_that_produced_it(tmp_path):
+    """A ratio between two wall-clock numbers is only a measurement if both
+    were measured by the same invocation on the same machine."""
+    from sp500bench.evaluation.timings import ROSTER_KEY, record_timing
+    path = tmp_path / "timings.json"
+    record_timing(path, "ZeroReturn", {"n_folds": 4, "seconds_per_fold": {"0": 0.18},
+                                       "forecasts_per_fold": {"0": 12650}})
+    record = json.loads(path.read_text())["ZeroReturn"]
+    for field in ("session_id", "platform", "machine", "accelerator"):
+        assert record.get(field), f"{field} missing from the timing record"
+
+
+def test_records_from_different_machines_are_not_comparable():
+    from sp500bench.evaluation.timings import comparable, hardware_fingerprint
+    here = hardware_fingerprint()
+    assert comparable(here, dict(here)) is True
+    assert comparable(here, {**here, "accelerator": "Tesla T4"}) is False
+    assert comparable(here, {**here, "session_id": "other"}) is False
+    assert comparable(here, {**here, "platform": "Linux-6.1"}) is False
+    # A record with no fingerprint at all cannot be compared to anything.
+    assert comparable(here, {}) is False
+
+
+def test_hardware_is_part_of_run_identity_so_folds_do_not_merge_across_machines():
+    from sp500bench.evaluation.timings import RUN_IDENTITY_FIELDS, merge_timing
+    assert "platform" in RUN_IDENTITY_FIELDS
+    assert "accelerator" in RUN_IDENTITY_FIELDS
+    prior = {"n_folds": 4, "seconds_per_fold": {"0": 61.4}, "platform": "macOS",
+             "accelerator": "cpu", "forecasts_per_fold": {"0": 12650}}
+    other = {"n_folds": 1, "seconds_per_fold": {"0": 9.0}, "platform": "Linux",
+             "accelerator": "Tesla T4", "forecasts_per_fold": {"0": 12650}}
+    merged = merge_timing(prior, other)
+    assert merged["replaced_prior_record"] is True
+    assert "platform" in merged["replaced_because"]

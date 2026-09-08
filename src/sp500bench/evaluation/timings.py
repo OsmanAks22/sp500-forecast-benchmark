@@ -19,9 +19,13 @@ runners and a guard in only one of them is not a guard.
 from __future__ import annotations
 
 import json
+import platform
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
-__all__ = ["RUN_IDENTITY_FIELDS", "merge_timing", "record_timing"]
+__all__ = ["ROSTER_KEY", "RUN_IDENTITY_FIELDS", "SESSION_ID", "comparable",
+           "hardware_fingerprint", "merge_timing", "record_timing"]
 
 
 # Fields that identify the run a timing belongs to. Per-fold times measured
@@ -37,7 +41,11 @@ RUN_IDENTITY_FIELDS = ("context", "device", "sample_count", "precision",
                        # Tier 2: a fold trained for a different number of steps
                        # or on a different lookback is not the same measurement
                        # either. `device` is already in the list above.
-                       "max_steps", "input_size", "num_workers")
+                       "max_steps", "input_size", "num_workers",
+                       # A fold re-timed on another machine is not the same
+                       # measurement, and merging the two would produce a
+                       # per-fold average across two pieces of hardware.
+                       "platform", "accelerator")
 
 
 def merge_timing(prior: dict | None, payload: dict) -> dict:
@@ -134,6 +142,75 @@ def merge_timing(prior: dict | None, payload: dict) -> dict:
 
 
 
+ROSTER_KEY = "_roster"
+
+# One id per process. Two timings share a session only if they were measured by
+# the same invocation on the same machine.
+SESSION_ID = f"{uuid.uuid4().hex[:12]}"
+
+
+def hardware_fingerprint() -> dict:
+    """What measured this timing, so a ratio between two rows can be checked.
+
+    A wall-clock number is meaningless without the machine that produced it, and
+    a *ratio* between two numbers measured on different machines is worse than
+    meaningless - it looks like a comparison. This study lost one timing file to
+    an overwrite and rebuilt half of it on a different machine from the other
+    half, which is exactly the situation in which a cross-model ratio silently
+    stops being a measurement of the models.
+
+    So every record carries its machine and its session, and the rule that
+    follows is mechanical rather than remembered: a ratio between two models is
+    legitimate only where both rows agree on ``hardware`` and ``session_id``.
+    """
+    info = {
+        "session_id": SESSION_ID,
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "processor": platform.processor() or platform.machine(),
+        "python": platform.python_version(),
+        "accelerator": "cpu",
+    }
+    try:                                               # pragma: no cover - no GPU locally
+        import torch
+        if torch.cuda.is_available():
+            info["accelerator"] = torch.cuda.get_device_name(0)
+            info["torch"] = str(torch.__version__)
+    except Exception:
+        pass
+    return info
+
+
+def comparable(a: dict, b: dict) -> bool:
+    """Whether a ratio between two timing records is a measurement at all."""
+    keys = ("session_id", "platform", "accelerator")
+    return all(a.get(k) is not None and a.get(k) == b.get(k) for k in keys)
+
+
+def _roster_block(models: list[str]) -> dict:
+    """What this file claims to describe, so a reader can check the claim.
+
+    The merge below protects the record against a pass that measured nothing
+    *inside* a session. It cannot protect against the file being replaced from
+    outside one - a copy back from a hosted notebook overwrote fifteen models'
+    timings with two, and nothing in the file said it had once held more. A
+    guard that cannot fire is not worth adding, so the answer is not another
+    check but a self-describing artefact: the file records which models it
+    covers and when, and a reader comparing that list against the forecasts on
+    disk sees the gap immediately.
+    """
+    return {
+        "models": sorted(models),
+        "n_models": len(models),
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "note": ("The models this file holds timings for. Compare it against "
+                 "the directories under forecasts/: a model with forecasts and "
+                 "no entry here means this file was replaced rather than "
+                 "merged, and the missing timings are gone rather than "
+                 "pending."),
+    }
+
+
 def record_timing(path: Path, model: str, payload: dict) -> None:
     """Merge one model's wall-clock into the shared record.
 
@@ -148,10 +225,13 @@ def record_timing(path: Path, model: str, payload: dict) -> None:
             existing = json.loads(path.read_text())
         except json.JSONDecodeError:
             print(f"  ! {path} is not valid JSON; starting a fresh record")
+    payload = {**hardware_fingerprint(), **payload}
     merged = merge_timing(existing.get(model), payload)
     if merged.get("last_invocation_note"):
         print(f"  timings: kept the existing {model} record "
               f"({merged.get('n_folds')} folds, {merged.get('n_forecasts', 0):,} "
               "forecasts) - this invocation ran no folds")
     existing[model] = merged
+    existing[ROSTER_KEY] = _roster_block(
+        [k for k in existing if k != ROSTER_KEY])
     path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n")
