@@ -132,7 +132,7 @@ def window_scores(losses: pd.DataFrame, models: list[str]) -> pd.DataFrame:
 
 
 def daily_mse(losses: pd.DataFrame, model: str) -> pd.Series:
-    """One row per session. Never the stacked panel - see CLAUDE.md."""
+    """One row per session. Never the stacked panel."""
     block = losses[(losses.model == model) & (losses.loss_type == "squared_error")]
     return block.groupby("ds")["value"].mean().sort_index()
 

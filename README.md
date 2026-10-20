@@ -626,3 +626,11 @@ Shi, Y. et al. (2025) 'Kronos: a foundation model for the language of financial
 markets', arXiv:2508.02739 (AAAI 2026).
 Zeng, A. et al. (2023) 'Are transformers effective for time series
 forecasting?', *AAAI*.
+
+## Note on commit references
+
+The dissertation cites the pre-registration commit as `d35c812`. On 20 October 2026 the commit metadata of this repository was tidied, which changed every commit hash; file contents and commit dates are unchanged. The pre-registration commit is the first commit in the history, titled *"Initial: frozen spec, evaluation framework, pre-registered hypotheses"* and dated 26 August 2026. To view it:
+
+```bash
+git log --reverse --format='%h %ad %s' --date=short | head -1
+```
