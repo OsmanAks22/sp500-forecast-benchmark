@@ -21,6 +21,3 @@ venv/
 .DS_Store
 .ipynb_checkpoints/
 
-# Local assistant configuration (not part of the project)
-CLAUDE.md
-.claude/
