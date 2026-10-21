@@ -5,7 +5,7 @@ description = "Three generations of forecasting models on S&P 500 daily returns"
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
-    "pandas",
+    "pandas>=2.2,<3",
     "scipy",
     "pyyaml",
     "python-dotenv",

@@ -33,10 +33,10 @@ foundation:
 	python scripts/run_experiment.py --tier foundation
 
 evaluate:
-	python scripts/evaluate.py --config configs/eval.yaml
+	python scripts/evaluate.py
 
 backtest:
-	python scripts/backtest.py --config configs/eval.yaml
+	python scripts/backtest.py
 
 test:
 	pytest tests/ -v

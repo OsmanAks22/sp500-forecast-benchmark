@@ -9,6 +9,17 @@ Supervisor: Dr Panagiotis Chountas
 
 ---
 
+## Final results (dissertation submitted September 2026)
+
+- **Scope:** 18 models scored (15 return models, 3 volatility models) on 50 S&P 500 stocks, 2005–2026 (272,200 stock-day observations), under purged walk-forward cross-validation with an embargo.
+- **Point forecasts:** no model significantly beats the zero-return forecast; the Model Confidence Set retains ZeroReturn (p = 0.114).
+- **Probabilistic forecasts:** zero-shot Chronos-2 has the lowest CRPS, 4.2% below the zero-return baseline; six other models also score below the baseline. In high-volatility periods its 80% intervals cover 77% of outcomes, against 68% for the baseline.
+- **Reproducibility:** 271 automated tests; every reported metric re-computes from the saved forecasts.
+
+The sections below are the pre-registration as frozen on 26 August 2026 (commit `d35c812`). *Results to date* is the interim position recorded on 2 September, before the GPU tiers were run; the dissertation reports the final results above.
+
+---
+
 ## What this study asks
 
 The 2023 question — *do transformers beat classical models on time series?* —
@@ -568,26 +579,25 @@ results/          metrics.parquet (model x fold x regime cells), losses.parquet
 
 ## Reproducing
 
-The library and its test suite are complete and run today:
-
 ```bash
 make setup        # installs the package and the [full] extra
-make test         # 80 tests, ~5 s
+make test         # 271 tests
 ```
 
-**The pipeline scripts are not yet written.** `scripts/` is empty, so
-`make data`, `make features`, `make baselines`, `make neural`,
-`make foundation`, `make evaluate`, `make backtest` and `make all` will fail
-until the five entry points they invoke exist. What is frozen and working so
-far is the specification in `configs/`, the evaluation and leakage machinery in
-`src/sp500bench/`, and the tests that hold them to it. The pre-registration in
-this file is timestamped independently of any of that, by commit date.
-
-Once the scripts land:
+The full pipeline, end to end:
 
 ```bash
-make all          # data → features → models → evaluation → backtest
+make data         # download OHLCV + FRED, apply release lags
+make features     # causal features and regime labels
+make baselines    # statistical tiers (CPU)
+make neural       # linear, recurrent and transformer tiers (GPU)
+make foundation   # foundation models, inference only (GPU)
+make evaluate     # metrics, DM tests, BH-FDR, regime stratification
+make backtest     # cost-aware strategy simulation
+python scripts/analyse.py
 ```
+
+`data/`, `forecasts/` and `results/` are not tracked in git. The GPU tiers were run on Kaggle's free tier.
 
 Seeds fixed at 20260826; `torch.use_deterministic_algorithms(True)`.
 Every run logs its config hash.
