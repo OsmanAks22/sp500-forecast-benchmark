@@ -171,6 +171,24 @@ def test_positions_are_applied_to_the_next_period_return() -> None:
     assert result["gross_return_ann"] == pytest.approx(0.10 / len(dates) * PERIODS)
 
 
+def test_forward_returns_are_applied_to_the_same_row() -> None:
+    """With the study's target convention, y[t] runs from close t to close t+1.
+
+    The position formed at t must earn y[t], not y[t+1]. Passing a forward
+    series through the default path would shift it a second time; this pins
+    the explicit option that the backtest script uses.
+    """
+    dates = _dates(5)
+    forward = pd.Series([0.10, 0.0, 0.0, 0.0, 0.0], index=dates)
+    positions = pd.Series([1.0, 0.0, 0.0, 0.0, 0.0], index=dates)
+
+    aligned = run_backtest(positions, forward, cost_bps=0.0, realised_is_forward=True)
+    assert aligned["gross_return_ann"] == pytest.approx(0.10 / len(dates) * PERIODS)
+
+    lagged = run_backtest(positions, forward, cost_bps=0.0)
+    assert lagged["gross_return_ann"] == pytest.approx(0.0)
+
+
 def test_long_flat_never_goes_short() -> None:
     forecast = pd.Series([-1.0, 0.0, 1.0, -0.5])
     assert positions_from_forecast(forecast, "long_flat").tolist() == [0.0, 0.0, 1.0, 0.0]

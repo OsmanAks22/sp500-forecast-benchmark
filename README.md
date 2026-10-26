@@ -9,14 +9,35 @@ Supervisor: Dr Panagiotis Chountas
 
 ---
 
+## Paper
+
+Akkese, O. and Chountas, P. (2026). *Do Time-Series Foundation Models Beat Zero? A Pre-Registered Benchmark of Daily Equity Return Forecasting.* Submitted to the *Journal of Forecasting*, October 2026.
+
+- **Pre-registration:** commit `d35c812` (26 August 2026). `git show d35c812:README.md` shows the hypotheses as frozen; their statements are unchanged in *Pre-registered hypotheses* below, and every note added under them later is dated.
+- **Hypotheses in the paper:** the paper states them in the dissertation's wording and gives the registered wording, with its outcomes, in notes to its Section 2.4 and Table 6.
+- **Results and forecasts:** `results/` and `forecasts/` are not tracked in git; they are archived on Zenodo (DOI to be added).
+- **AI assistance:** as stated in the dissertation, generative AI tools assisted with code implementation; the research design, analytical judgements and verification of results remained the author's own.
+
 ## Final results (dissertation submitted September 2026)
 
 - **Scope:** 18 models scored (15 return models, 3 volatility models) on 50 S&P 500 stocks, 2005–2026 (272,200 stock-day observations), under purged walk-forward cross-validation with an embargo.
 - **Point forecasts:** no model significantly beats the zero-return forecast; the Model Confidence Set retains ZeroReturn (p = 0.114).
 - **Probabilistic forecasts:** zero-shot Chronos-2 has the lowest CRPS, 4.2% below the zero-return baseline; six other models also score below the baseline. In high-volatility periods its 80% intervals cover 77% of outcomes, against 68% for the baseline.
-- **Reproducibility:** 271 automated tests; every reported metric re-computes from the saved forecasts.
+- **Hypotheses, registered wording:** H1 not falsified; H2 supported descriptively (calibration against ARIMA/ETS, in the volatile folds only); H3 supported on the volatility axis; H4 not supported (the narrowing on the clean slice is shared by models without pre-training); H5 not supported (no model beats Log-HAR, and TTM, which H5 cites, was not run on the volatility target).
+- **Reproducibility:** 272 automated tests; every reported metric re-computes from the saved forecasts, which are archived with the results on Zenodo.
 
-The sections below are the pre-registration as frozen on 26 August 2026 (commit `d35c812`). *Results to date* is the interim position recorded on 2 September, before the GPU tiers were run; the dissertation reports the final results above.
+The hypotheses below are quoted as frozen on 26 August 2026 (commit `d35c812`); notes added after the freeze are dated where they appear. *Results to date* is the interim position recorded on 2 September, before the GPU tiers were run; the final results are above.
+
+## Corrections recorded on 25 October 2026
+
+Recorded while preparing the paper. The hypotheses and their dated notes are left as they were; these notes correct statements elsewhere in this file.
+
+- **Clean slice.** *Design decisions* says the clean slice post-dates every foundation-model checkpoint. That holds for Kronos-small, whose documented cutoff is June 2024. TimesFM-2.5 (released 15 September 2025) and Chronos-2 (released October 2025) appeared after the slice starts on 1 September 2025 and document no cutoff, so for them the slice is not certified clean.
+- **Quantile grid.** The nine-level grid in *Design decisions* was adopted on 1 September 2026 (`configs/eval.yaml`, version 2), before any competing model was run; the grid at the freeze had five levels.
+- **PatchTST tuning.** *Leakage controls* mentions "the single tuning budget spent on PatchTST". The 15-trial budget in `configs/models.yaml` was never used: there is no tuning code, and PatchTST ran with the common 500-step configuration.
+- **H4 caveat.** The italic line under H4 read "for the others" at the freeze; "four" was added on 1 September 2026 (`de5f361`), when TTM joined the roster. It is the only edit to the frozen text of *Pre-registered hypotheses*; everything else added there is a dated note.
+- **Registry.** *The twenty models* is the registry from 2 September 2026. At the freeze it listed 17 specifications. GJR-GARCH and TTM were added on 1 September (commit `de5f361`), before any model was run, and ZeroReturn on 2 September (`34faec6`), with the identification of the H1 benchmark. Moirai-2.0 was excluded on 5 September (`9a63748`), leaving 19 runnable; NLinear's output is invalid, so 18 are scored.
+- **Backtest timing.** `scripts/backtest.py` passed the forward target `y[t]`, the return from the close of `t` to the close of `t+1`, to `run_backtest`, which shifts positions by one session, so every position earned the following session's return. `run_backtest` now takes `realised_is_forward=True` for a forward series, a regression test pins the alignment, and `results/backtest.parquet` was regenerated; the lagged file is kept as `results/backtest_lagged_2026-09-08.parquet`. Turnover is unchanged. Break-even costs move (Chronos-2 from 200.69 to 194.99 bps), and four strategies now fall below 5 bps: LastReturn, RandomWalkWithDrift, DLinear and TimesNet. The dissertation's economic figures come from the lagged backtest; the paper uses the corrected one.
 
 ---
 
@@ -566,22 +587,24 @@ src/sp500bench/
   models/         uniform registry over all four tiers; Tier 0 baselines and
                   Tier 1 statistical share one statsforecast driver
   backtest/       cost-aware simulation
-tests/            leakage (28) + numerical (17) + MCS/HAR/robust-SE (21)
-                  + backtest cost accounting (18) + config gate (10)
-                  + H1 benchmark identity (5)
-scripts/          pipeline entry points — build_dataset, build_features,
-                  run_experiment and evaluate are written; run_experiment
-                  executes Tiers 0 and 1 and reports every other model as
-                  pending
+tests/            272 tests: leakage, statistics, MCS and volatility,
+                  backtest costs, configuration, baselines, neural tier,
+                  foundation adapters, partial quantile grids, forecast
+                  validation, broken-model handling
+scripts/          pipeline entry points: build_dataset, build_features,
+                  run_experiment, run_foundation, validate_forecasts,
+                  evaluate, backtest, analyse, cutoff_split
 results/          metrics.parquet (model x fold x regime cells), losses.parquet
-                  (per-observation losses for DM and the MCS), timings.json
+                  (per-observation losses for DM and the MCS), inference.parquet
+                  (DM, BH and MCS), backtest.parquet, cutoff_split.parquet,
+                  timings.json
 ```
 
 ## Reproducing
 
 ```bash
 make setup        # installs the package and the [full] extra
-make test         # 271 tests
+make test         # 272 tests
 ```
 
 The full pipeline, end to end:

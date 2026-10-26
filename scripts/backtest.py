@@ -100,11 +100,17 @@ def backtest_model(scored: pd.DataFrame, model: str, median_column: str,
         for ticker, group in scored.groupby("unique_id", sort=True):
             group = group.sort_values("ds")
             signal = group[median_column].to_numpy(dtype=float)
+            # y[t] is the return from the close of t to the close of t+1 (the
+            # forecast target), so the position formed at t earns y[t] on the
+            # same row: realised_is_forward=True below. Until 25 October 2026
+            # this series went through the default path, which shifted every
+            # position by one more session.
             realised = pd.Series(group["y"].to_numpy(dtype=float),
                                  index=pd.DatetimeIndex(group["ds"]))
             positions = positions_from_forecast(
                 pd.Series(signal, index=realised.index), mode=mode)
             summary = run_backtest(positions, realised, cost_bps=cost,
+                                   realised_is_forward=True,
                                    n_trials=n_trials)
             summary.update({"model": model, "unique_id": ticker,
                             "cost_bps": float(cost), "scope": "ticker"})
@@ -142,6 +148,7 @@ def buy_and_hold(scored: pd.DataFrame, cost_levels: list[float],
                                  index=pd.DatetimeIndex(group["ds"]))
             positions = pd.Series(1.0, index=realised.index)
             summary = run_backtest(positions, realised, cost_bps=cost,
+                                   realised_is_forward=True,
                                    n_trials=n_trials)
             summary.update({"model": "BuyAndHold", "unique_id": ticker,
                             "cost_bps": float(cost), "scope": "ticker"})
