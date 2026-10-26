@@ -44,12 +44,22 @@ def run_backtest(
     cost_bps: float = 5.0,
     n_trials: int = 1,
     periods_per_year: int = 252,
+    realised_is_forward: bool = False,
 ) -> dict[str, float | str]:
     """Simulate the strategy and return its performance summary.
 
     Positions are applied to the *next* period's return - the signal formed at
     the close of ``t`` earns ``r[t+1]``. Getting this off by one turns a null
     result into a spectacular one, so it is done here, once, explicitly.
+
+    By default ``realised_returns`` is indexed by the session in which the
+    return ends, so ``r[t+1]`` sits one row after the signal and positions are
+    shifted by one row. The study's target is indexed the other way: ``y[t]`` is
+    the return from the close of ``t`` to the close of ``t+1``. Pass
+    ``realised_is_forward=True`` for such a series; the position is then applied
+    to the same row and not shifted a second time. Feeding the forward target
+    through the default path delays every position by one session, which is the
+    defect corrected on 25 October 2026.
 
     Cost convention - round trip
     ----------------------------
@@ -69,7 +79,8 @@ def run_backtest(
     infer it.
     """
     pos = positions.reindex(realised_returns.index).fillna(0.0)
-    gross = pos.shift(1).fillna(0.0) * realised_returns
+    held = pos if realised_is_forward else pos.shift(1).fillna(0.0)
+    gross = held * realised_returns
 
     traded = pos.diff().abs().fillna(pos.abs())
     cost = traded * (cost_bps / 2.0 / 10_000.0)
